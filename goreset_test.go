@@ -22,6 +22,7 @@ func TestGenerateMatchesCommitted(t *testing.T) {
 	}{
 		{dir: "internal/cases/bulk", typeName: "Request", pkgName: "bulk"},
 		{dir: "internal/cases/fieldwise", typeName: "State", pkgName: "fieldwise"},
+		{dir: "internal/cases/wide", typeName: "Slicy", pkgName: "wide"},
 	}
 
 	for _, tc := range cases {
@@ -89,7 +90,7 @@ func TestGenerateModes(t *testing.T) {
 	}
 
 	if !strings.Contains(string(src), "keepBigKept := r.BigKept") || !strings.Contains(string(src), "r.BigKept.Reset()") {
-		t.Error("reset:\"keep\" must keep a big value across the bulk assignment")
+		t.Error("a value with Reset is kept across the bulk assignment whatever its size")
 	}
 
 	fieldwise, err := goreset.Load("internal/cases/fieldwise")
@@ -123,9 +124,8 @@ func TestGenerateModes(t *testing.T) {
 		t.Error("a struct with a lock must not be reset in one assignment")
 	}
 
-	// the comment names every field that rules bulk mode out, and why
+	// the comment names the field that rules bulk mode out, and why
 	want := "// Reset zeroes r field by field, not in one assignment:\n" +
-		"//   - Big (128 bytes, has Reset) is cheaper to reset in place than to copy twice\n" +
 		"//   - Mu is a sync.Mutex, which must not be copied\n"
 	if !strings.Contains(string(src), want) {
 		t.Errorf("field-wise output lacks the reasons comment %q", want)
@@ -145,8 +145,36 @@ func TestAnalyzeHints(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !res.Bulk || len(res.Hints) != 0 || len(res.Source) == 0 {
-		t.Fatalf("Analyze(Request) = bulk %v, hints %q", res.Bulk, res.Hints)
+	if !res.Bulk || len(res.Hints) != 0 || len(res.Source) == 0 || res.BulkCost > res.FieldwiseCost {
+		t.Fatalf("Analyze(Request) = bulk %v, hints %q, costs %d vs %d", res.Bulk, res.Hints, res.BulkCost, res.FieldwiseCost)
+	}
+
+	// no lock, but eight slices and nothing else: the model says field by field
+	wide, err := goreset.Load("internal/cases/wide")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err = wide.Analyze("Slicy")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if res.Bulk || res.BulkCost <= res.FieldwiseCost || res.BulkCost != 36 || res.FieldwiseCost != 16 {
+		t.Fatalf("Analyze(Slicy) = bulk %v, costs %d vs %d; want field-wise, 36 vs 16",
+			res.Bulk, res.BulkCost, res.FieldwiseCost)
+	}
+
+	wantHint := "Slicy: one assignment would zero all 192 bytes and restore 8 fields (cost 36) " +
+		"where resetting the 8 fields one by one costs 16; fewer slices and kept values, " +
+		"or a smaller struct, would turn that around"
+	if !slices.Equal(res.Hints, []string{wantHint}) {
+		t.Fatalf("Analyze(Slicy) hints = %q, want %q", res.Hints, wantHint)
+	}
+
+	if !strings.Contains(string(res.Source), "zeroing all 192 bytes and restoring 8 fields costs 36, "+
+		"resetting the 8 fields one by one costs 16") {
+		t.Fatalf("Slicy comment lacks the costs:\n%s", res.Source)
 	}
 
 	fieldwise, err := goreset.Load("internal/cases/fieldwise")
@@ -160,8 +188,6 @@ func TestAnalyzeHints(t *testing.T) {
 	}
 
 	want := []string{
-		"Big: tag it reset:\"keep\" to copy it across the assignment anyway (128 bytes, twice) " +
-			"and reset the rest of the struct in one go, or make it a *Big",
 		"Mu: a sync.Mutex cannot be kept across the assignment; make it a *sync.Mutex " +
 			"(tagged reset:\"-\", so it is kept and never reset), or keep the lock outside the pooled value",
 	}
