@@ -117,6 +117,14 @@ func TestGenerateModes(t *testing.T) {
 	if strings.Contains(string(src), "*r = State{}") {
 		t.Error("a struct with a lock must not be reset in one assignment")
 	}
+
+	// the comment names every field that rules bulk mode out, and why
+	want := "// Reset zeroes r field by field, not in one assignment:\n" +
+		"//   - Big (128 bytes, has Reset) is cheaper to reset in place than to copy twice\n" +
+		"//   - Mu is a sync.Mutex, which must not be copied\n"
+	if !strings.Contains(string(src), want) {
+		t.Errorf("field-wise output lacks the reasons comment %q", want)
+	}
 }
 
 func TestGenerateErrors(t *testing.T) {

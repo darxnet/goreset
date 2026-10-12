@@ -30,8 +30,9 @@ type fieldInfo struct {
 	Restore string
 	// NoBulk marks a field whose state cannot be kept cheaply across `*r = T{}`
 	// (a lock, or a big value struct with its own Reset): the type then uses
-	// field-wise mode.
+	// field-wise mode, and Reason says why, in the generated comment.
 	NoBulk bool
+	Reason string
 }
 
 // Generate returns the gofmt-ed source of a file declaring `func (r *T) Reset()`
@@ -113,7 +114,15 @@ func (p *Package) Generate(typeName string) ([]byte, error) {
 	// Bulk mode zeroes the struct in one assignment and restores the fields
 	// that keep state (slices keep their arrays, tagged fields keep their
 	// values). It is used unless a field is cheaper to reset in place.
-	bulk := !slices.ContainsFunc(fields, func(f fieldInfo) bool { return f.NoBulk })
+	var reasons []string
+
+	for _, f := range fields {
+		if f.NoBulk {
+			reasons = append(reasons, f.Reason)
+		}
+	}
+
+	bulk := len(reasons) == 0
 
 	if bulk {
 		// see tagImports: field-type imports are unused by bulk code
@@ -127,12 +136,14 @@ func (p *Package) Generate(typeName string) ([]byte, error) {
 		TypeName    string
 		Fields      []fieldInfo
 		Imports     []string
+		Reasons     []string
 		Bulk        bool
 	}{
 		PackageName: p.pkg.Name(),
 		TypeName:    typeName,
 		Fields:      fields,
 		Imports:     imports,
+		Reasons:     reasons,
 		Bulk:        bulk,
 	}
 
@@ -217,6 +228,7 @@ func (p *Package) resetCode(f *types.Var, release string) fieldInfo {
 	if isForbidden(typeName) {
 		info.Code = fmt.Sprintf("// r.%s (type %s) skip forbidden", info.Field, typeName)
 		info.NoBulk = true // a lock cannot be kept by value
+		info.Reason = fmt.Sprintf("%s is a %s, which must not be copied", info.Field, typeName)
 
 		return info
 	}
@@ -241,11 +253,13 @@ func (p *Package) resetCode(f *types.Var, release string) fieldInfo {
 
 		// Keeping a value struct across the zeroing copies it twice; that is
 		// fine for small ones, a large one is cheaper to reset in place.
-		if p.sizes.Sizeof(f.Type()) <= maxKeepSize {
+		if size := p.sizes.Sizeof(f.Type()); size <= maxKeepSize {
 			info.Keep = fmt.Sprintf("keep%s := r.%s", info.Field, info.Field)
 			info.Restore = fmt.Sprintf("r.%s = keep%s\n\tr.%s.Reset()", info.Field, info.Field, info.Field)
 		} else {
 			info.NoBulk = true
+			info.Reason = fmt.Sprintf("%s (%d bytes, has Reset) is cheaper to reset in place than to copy twice",
+				info.Field, size)
 		}
 
 		return info
@@ -350,7 +364,10 @@ func (r *{{.TypeName}}) Reset() {
 }
 {{- else}}
 
-// Reset zeroes r field by field: a field cannot be kept across a bulk assignment.
+// Reset zeroes r field by field, not in one assignment:
+{{- range .Reasons}}
+//   - {{.}}
+{{- end}}
 func (r *{{.TypeName}}) Reset() {
 {{- range .Fields}}
 	{{.Code}}
