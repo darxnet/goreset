@@ -2,7 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/darxnet/goreset.svg)](https://pkg.go.dev/github.com/darxnet/goreset)
 [![Go](https://github.com/darxnet/goreset/actions/workflows/release.yml/badge.svg)](https://github.com/darxnet/goreset/actions/workflows/release.yml)
-[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/darxnet/goreset/badges/coverage.json)](https://github.com/darxnet/goreset/actions/workflows/release.yml)
+[![Coverage](https://codecov.io/gh/darxnet/goreset/graph/badge.svg)](https://codecov.io/gh/darxnet/goreset)
 
 `goreset` generates `Reset()` methods for structs that are reused through a
 `sync.Pool` or a free list: the value goes back to its zero state, but keeps
