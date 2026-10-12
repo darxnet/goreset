@@ -42,6 +42,15 @@ func PutBuffer(b *Buffer) {
 	Released.Add(1)
 }
 
+// Big is too big to keep by copy on its own; `reset:"keep"` keeps it anyway.
+type Big struct {
+	A [16]uint64
+}
+
+func (b *Big) Reset() {
+	b.A = [16]uint64{}
+}
+
 // NotAStruct is here for the error path of Generate.
 type NotAStruct int
 
@@ -73,6 +82,7 @@ type Request struct {
 	Mask    uint32      `reset:"value=^uint32(0)"`
 	Level   uint8       `reset:"value=consts.DefaultLevel,import=github.com/darxnet/goreset/internal/cases/consts"`
 	Keep    []byte      `reset:"-"`
+	BigKept Big         `reset:"keep"`
 	Count   atomic.Int64
 	Flag    atomic.Bool
 	PtrA    atomic.Pointer[int]

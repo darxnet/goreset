@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -87,6 +88,10 @@ func TestGenerateModes(t *testing.T) {
 		t.Error("bulk output must not import the field types")
 	}
 
+	if !strings.Contains(string(src), "keepBigKept := r.BigKept") || !strings.Contains(string(src), "r.BigKept.Reset()") {
+		t.Error("reset:\"keep\" must keep a big value across the bulk assignment")
+	}
+
 	fieldwise, err := goreset.Load("internal/cases/fieldwise")
 	if err != nil {
 		t.Fatal(err)
@@ -124,6 +129,45 @@ func TestGenerateModes(t *testing.T) {
 		"//   - Mu is a sync.Mutex, which must not be copied\n"
 	if !strings.Contains(string(src), want) {
 		t.Errorf("field-wise output lacks the reasons comment %q", want)
+	}
+}
+
+func TestAnalyzeHints(t *testing.T) {
+	t.Parallel()
+
+	bulk, err := goreset.Load("internal/cases/bulk")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := bulk.Analyze("Request")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !res.Bulk || len(res.Hints) != 0 || len(res.Source) == 0 {
+		t.Fatalf("Analyze(Request) = bulk %v, hints %q", res.Bulk, res.Hints)
+	}
+
+	fieldwise, err := goreset.Load("internal/cases/fieldwise")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err = fieldwise.Analyze("State")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{
+		"Big: tag it reset:\"keep\" to copy it across the assignment anyway (128 bytes, twice) " +
+			"and reset the rest of the struct in one go, or make it a *Big",
+		"Mu: a sync.Mutex cannot be kept across the assignment; make it a *sync.Mutex " +
+			"(tagged reset:\"-\", so it is kept and never reset), or keep the lock outside the pooled value",
+	}
+
+	if res.Bulk || !slices.Equal(res.Hints, want) {
+		t.Fatalf("Analyze(State) = bulk %v, hints %q, want %q", res.Bulk, res.Hints, want)
 	}
 }
 
