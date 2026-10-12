@@ -111,8 +111,14 @@ for tools that want the source without the file.
 - A nested value's `Reset()` is called after the bulk assignment, so it sees
   its own state, not zeroes.
 
-See also [gocopy](https://github.com/darxnet/gocopy), which generates
-`CopyFrom`/`Copy` for the same kind of structs.
+## See also
+
+The sibling modules follow the same rule — nothing allocated on the hot path,
+the zero value ready to use:
+
+- [goshard](https://github.com/darxnet/goshard) — sharded, lock-based concurrent map for high-churn data: stores allocate nothing
+- [gosync](https://github.com/darxnet/gosync) — generic concurrent map with `sync.Map` semantics and no interface boxing, for read-mostly data
+- [gocopy](https://github.com/darxnet/gocopy) — generates `CopyFrom`/`Copy` that reuse the destination's memory instead of allocating
 
 ## License
 
