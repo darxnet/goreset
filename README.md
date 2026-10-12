@@ -69,7 +69,13 @@ a `sync` type, or a value with its own `Reset()` bigger than 64 bytes (cheaper
 to reset in place than to copy twice). Every field then gets its own
 statement; `sync` fields are not touched.
 
-The mode is chosen per type, and shown in the comment of the generated method.
+The mode is chosen per type, and the comment of the generated method says
+which one — and, for field-wise mode, which fields ruled bulk mode out:
+
+```go
+// Reset zeroes r field by field, not in one assignment:
+//   - Mu is a sync.Mutex, which must not be copied
+```
 
 ## Installation
 

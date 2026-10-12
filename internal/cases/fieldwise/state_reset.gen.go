@@ -7,7 +7,9 @@ import (
 	"time"
 )
 
-// Reset zeroes r field by field: a field cannot be kept across a bulk assignment.
+// Reset zeroes r field by field, not in one assignment:
+//   - Big (128 bytes, has Reset) is cheaper to reset in place than to copy twice
+//   - Mu is a sync.Mutex, which must not be copied
 func (r *State) Reset() {
 	r.Addr = netip.Addr{}
 	r.Any = nil
