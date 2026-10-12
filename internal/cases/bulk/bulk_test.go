@@ -35,6 +35,7 @@ func TestRequestReset(t *testing.T) { //nolint:paralleltest // Released is share
 		Mask:    1,
 		Level:   9,
 		Keep:    []byte("keep"),
+		BigKept: bulk.Big{A: [16]uint64{1}},
 	}
 	r.Count.Store(5)
 	r.Flag.Store(true)
@@ -75,6 +76,10 @@ func assertZeroed(t *testing.T, r *bulk.Request, dataCap, namesCap int) {
 
 	if r.Dim != (bulk.Dimension{}) {
 		t.Fatalf("Dim = %+v, want zero", r.Dim)
+	}
+
+	if r.BigKept != (bulk.Big{}) {
+		t.Fatalf("BigKept = %+v, want reset through Reset", r.BigKept)
 	}
 
 	if r.Count.Load() != 0 || r.Flag.Load() || r.PtrA.Load() != nil {

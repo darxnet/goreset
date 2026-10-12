@@ -33,19 +33,43 @@ type fieldInfo struct {
 	// field-wise mode, and Reason says why, in the generated comment.
 	NoBulk bool
 	Reason string
+	// Hint says what would let the type keep bulk mode despite this field.
+	Hint string
+}
+
+// Result is what Analyze found out about a type.
+type Result struct {
+	// Source is the generated file, as Generate returns it.
+	Source []byte
+	// Hints say how the type could be reset in one assignment instead of
+	// field by field: one per field that rules bulk mode out. Empty when Bulk.
+	Hints []string
+	// Bulk reports whether Reset is one assignment with the kept fields
+	// restored after it (true), or one statement per field (false).
+	Bulk bool
 }
 
 // Generate returns the gofmt-ed source of a file declaring `func (r *T) Reset()`
 // for the struct type named typeName.
 func (p *Package) Generate(typeName string) ([]byte, error) {
+	res, err := p.Analyze(typeName)
+
+	return res.Source, err
+}
+
+// Analyze is Generate with the findings behind the output: the mode, and for
+// field-wise mode, how to get bulk mode back.
+func (p *Package) Analyze(typeName string) (Result, error) {
+	var res Result
+
 	obj := p.pkg.Scope().Lookup(typeName)
 	if obj == nil {
-		return nil, fmt.Errorf("goreset: type %s not found in package %s", typeName, p.pkg.Name())
+		return res, fmt.Errorf("goreset: type %s not found in package %s", typeName, p.pkg.Name())
 	}
 
 	structType, ok := obj.Type().Underlying().(*types.Struct)
 	if !ok {
-		return nil, fmt.Errorf("goreset: %s is not a struct", typeName)
+		return res, fmt.Errorf("goreset: %s is not a struct", typeName)
 	}
 
 	var (
@@ -97,7 +121,7 @@ func (p *Package) Generate(typeName string) ([]byte, error) {
 			})
 
 		default:
-			fields = append(fields, p.resetCode(f, opts.release))
+			fields = append(fields, p.resetCode(f, opts))
 		}
 	}
 
@@ -119,10 +143,12 @@ func (p *Package) Generate(typeName string) ([]byte, error) {
 	for _, f := range fields {
 		if f.NoBulk {
 			reasons = append(reasons, f.Reason)
+			res.Hints = append(res.Hints, f.Hint)
 		}
 	}
 
 	bulk := len(reasons) == 0
+	res.Bulk = bulk
 
 	if bulk {
 		// see tagImports: field-type imports are unused by bulk code
@@ -149,15 +175,17 @@ func (p *Package) Generate(typeName string) ([]byte, error) {
 
 	var buf bytes.Buffer
 	if err := tmpl.Execute(&buf, data); err != nil {
-		return nil, fmt.Errorf("goreset: template: %w", err)
+		return res, fmt.Errorf("goreset: template: %w", err)
 	}
 
 	src, err := format.Source(buf.Bytes())
 	if err != nil {
-		return nil, fmt.Errorf("goreset: format generated code: %w\n%s", err, buf.String())
+		return res, fmt.Errorf("goreset: format generated code: %w\n%s", err, buf.String())
 	}
 
-	return src, nil
+	res.Source = src
+
+	return res, nil
 }
 
 type tagOptions struct {
@@ -165,6 +193,9 @@ type tagOptions struct {
 	release    string
 	call       string
 	value      string
+	// keep copies a value with Reset across the bulk assignment whatever its
+	// size, instead of switching the type to field-wise mode: `reset:"keep"`.
+	keep bool
 }
 
 func parseTag(tag string) tagOptions {
@@ -172,6 +203,8 @@ func parseTag(tag string) tagOptions {
 
 	for part := range strings.SplitSeq(tag, ",") {
 		switch {
+		case part == "keep":
+			opts.keep = true
 		case cut(part, "import=", &opts.importPath),
 			cut(part, "release=", &opts.release),
 			cut(part, "call=", &opts.call),
@@ -192,7 +225,9 @@ func cut(part, prefix string, dst *string) bool {
 	return ok
 }
 
-func (p *Package) resetCode(f *types.Var, release string) fieldInfo {
+func (p *Package) resetCode(f *types.Var, opts tagOptions) fieldInfo {
+	release := opts.release
+
 	var (
 		info       fieldInfo
 		importPath string
@@ -229,6 +264,9 @@ func (p *Package) resetCode(f *types.Var, release string) fieldInfo {
 		info.Code = fmt.Sprintf("// r.%s (type %s) skip forbidden", info.Field, typeName)
 		info.NoBulk = true // a lock cannot be kept by value
 		info.Reason = fmt.Sprintf("%s is a %s, which must not be copied", info.Field, typeName)
+		info.Hint = fmt.Sprintf("%s: a %s cannot be kept across the assignment; make it a *%s "+
+			"(tagged reset:\"-\", so it is kept and never reset), or keep the lock outside the pooled value",
+			info.Field, typeName, typeName)
 
 		return info
 	}
@@ -252,14 +290,19 @@ func (p *Package) resetCode(f *types.Var, release string) fieldInfo {
 		info.Code = fmt.Sprintf("r.%s.Reset()", info.Field)
 
 		// Keeping a value struct across the zeroing copies it twice; that is
-		// fine for small ones, a large one is cheaper to reset in place.
-		if size := p.sizes.Sizeof(f.Type()); size <= maxKeepSize {
+		// fine for small ones, a large one is cheaper to reset in place —
+		// unless the field says reset:"keep", and the rest of the struct gets
+		// its one assignment.
+		if size := p.sizes.Sizeof(f.Type()); size <= maxKeepSize || opts.keep {
 			info.Keep = fmt.Sprintf("keep%s := r.%s", info.Field, info.Field)
 			info.Restore = fmt.Sprintf("r.%s = keep%s\n\tr.%s.Reset()", info.Field, info.Field, info.Field)
 		} else {
 			info.NoBulk = true
 			info.Reason = fmt.Sprintf("%s (%d bytes, has Reset) is cheaper to reset in place than to copy twice",
 				info.Field, size)
+			info.Hint = fmt.Sprintf("%s: tag it reset:\"keep\" to copy it across the assignment anyway "+
+				"(%d bytes, twice) and reset the rest of the struct in one go, or make it a *%s",
+				info.Field, size, typeName)
 		}
 
 		return info

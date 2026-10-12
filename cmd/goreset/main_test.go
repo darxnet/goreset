@@ -10,6 +10,8 @@ import (
 
 const caseSource = `package c
 
+import "sync"
+
 type Request struct {
 	Data []byte
 	N    int
@@ -17,6 +19,11 @@ type Request struct {
 
 type Response struct {
 	Body []byte
+}
+
+type Guarded struct {
+	Mu   sync.Mutex
+	Data []byte
 }
 `
 
@@ -61,6 +68,27 @@ func TestRun(t *testing.T) {
 
 	if !strings.Contains(stderr.String(), "wrote") {
 		t.Fatalf("stderr = %q, want the written files", stderr.String())
+	}
+}
+
+func TestRunHints(t *testing.T) {
+	t.Parallel()
+
+	dir := writeCase(t)
+
+	var stderr bytes.Buffer
+
+	if code := run([]string{"-dir", dir, "-type", "Guarded"}, &stderr); code != 0 {
+		t.Fatalf("exit code %d: %s", code, stderr.String())
+	}
+
+	for _, want := range []string{
+		"Guarded is reset field by field; for one assignment:",
+		"  - Mu: a sync.Mutex cannot be kept across the assignment",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr = %q, want %q", stderr.String(), want)
+		}
 	}
 }
 

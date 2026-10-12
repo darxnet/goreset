@@ -8,6 +8,7 @@ import (
 
 // Reset zeroes r in one assignment and gives the slices their arrays back.
 func (r *Request) Reset() {
+	keepBigKept := r.BigKept
 	if r.Buf != nil {
 		PutBuffer(r.Buf)
 	}
@@ -22,6 +23,8 @@ func (r *Request) Reset() {
 	keepTimer := r.Timer
 
 	*r = Request{}
+	r.BigKept = keepBigKept
+	r.BigKept.Reset()
 	r.Cleared = keepCleared
 	r.Cleared.Clear()
 	r.Data = keepData

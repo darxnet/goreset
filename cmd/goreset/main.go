@@ -55,7 +55,7 @@ func run(args []string, stderr io.Writer) int {
 			continue
 		}
 
-		src, err := pkg.Generate(typeName)
+		res, err := pkg.Analyze(typeName)
 		if err != nil {
 			say("%v", err)
 
@@ -64,13 +64,21 @@ func run(args []string, stderr io.Writer) int {
 
 		name := filepath.Join(*dirFlag, goreset.FileName(typeName))
 
-		if err := os.WriteFile(name, src, 0o600); err != nil {
+		if err := os.WriteFile(name, res.Source, 0o600); err != nil {
 			say("goreset: write %s: %v", name, err)
 
 			return 1
 		}
 
 		say("goreset: wrote %s", name)
+
+		if !res.Bulk {
+			say("goreset: %s is reset field by field; for one assignment:", typeName)
+
+			for _, hint := range res.Hints {
+				say("  - %s", hint)
+			}
+		}
 	}
 
 	return 0

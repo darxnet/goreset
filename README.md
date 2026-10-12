@@ -57,6 +57,7 @@ Struct tags change the treatment of a field:
 | `reset:"value=pkg.Const,import=example.com/pkg"` | the same with an import the expression needs |
 | `reset:"call=Method"` | kept; `r.F.Method()` is called (`call=Stop` for a `*time.Timer`) |
 | `reset:"release=Func"` | pointer with `Reset()`: `Func(r.F)` is called and the field set to nil |
+| `reset:"keep"` | value with `Reset()` bigger than 64 bytes: copy it across the bulk assignment anyway, so the type keeps bulk mode |
 
 ## Two modes
 
@@ -76,6 +77,23 @@ which one — and, for field-wise mode, which fields ruled bulk mode out:
 // Reset zeroes r field by field, not in one assignment:
 //   - Mu is a sync.Mutex, which must not be copied
 ```
+
+When that happens the generator also says, on stderr, what would get bulk
+mode back — for each field, the change that would do it:
+
+```
+goreset: wrote state_reset.gen.go
+goreset: State is reset field by field; for one assignment:
+  - Big: tag it reset:"keep" to copy it across the assignment anyway (128 bytes, twice) and reset the rest of the struct in one go, or make it a *Big
+  - Mu: a sync.Mutex cannot be kept across the assignment; make it a *sync.Mutex (tagged reset:"-", so it is kept and never reset), or keep the lock outside the pooled value
+```
+
+Whether bulk mode is worth it is a measurement: one `memclr` of the struct
+plus two copies of the kept value, against one statement per field. For a
+struct with dozens of fields it usually is.
+
+[`Package.Analyze`](https://pkg.go.dev/github.com/darxnet/goreset#Package.Analyze)
+returns the same findings to other tools.
 
 ## Installation
 
