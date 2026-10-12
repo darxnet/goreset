@@ -57,43 +57,51 @@ Struct tags change the treatment of a field:
 | `reset:"value=pkg.Const,import=example.com/pkg"` | the same with an import the expression needs |
 | `reset:"call=Method"` | kept; `r.F.Method()` is called (`call=Stop` for a `*time.Timer`) |
 | `reset:"release=Func"` | pointer with `Reset()`: `Func(r.F)` is called and the field set to nil |
-| `reset:"keep"` | value with `Reset()` bigger than 64 bytes: copy it across the bulk assignment anyway, so the type keeps bulk mode |
 
 ## Two modes
 
-**Bulk** (the default): the fields to keep are saved, the struct is zeroed in
-one assignment, the kept fields are put back. One `memclr` for the whole
-struct, no per-field code for the zeroed ones.
+**Bulk**: the fields to keep are saved, the struct is zeroed in one
+assignment, the kept fields are put back. One `memclr` for the whole struct,
+no per-field code for the zeroed ones.
 
-**Field by field**: used when a field cannot be kept across the assignment —
-a `sync` type, or a value with its own `Reset()` bigger than 64 bytes (cheaper
-to reset in place than to copy twice). Every field then gets its own
-statement; `sync` fields are not touched.
+**Field by field**: one statement per field; `sync` fields are not touched.
 
-The mode is chosen per type, and the comment of the generated method says
-which one — and, for field-wise mode, which fields ruled bulk mode out:
+The mode is chosen per type by a cost model, in units of one field store:
+
+| | bulk | field by field |
+|---|---|---|
+| the struct | `memclr`: 1 per 16 bytes | — |
+| plain field (number, pointer, string, atomic...) | 0 | 1 |
+| slice | 3 (clear, keep, restore) | 2 (clear, reslice) |
+| value with `Reset()` | 2 + 2 per 16 bytes (copied out and back) | 1 (the call) |
+| pointer with `Reset()`, `call=`, `reset:"-"` | 2 (keep, restore) | 1 |
+| `value=` | 1 | 1 |
+| array, struct without `Reset()` | 0 | 1 per 16 bytes |
+
+The cheaper mode is generated; a `sync` field forces field-wise mode whatever
+the costs. The constants were fitted on two real structs (700 bytes / 95
+fields: both modes equal; 2400 bytes / 74 fields: field-wise 2.5x faster) —
+a model, not a measurement, so a struct near the break-even point is worth a
+benchmark of its own.
+
+The comment of the generated method says which mode and why:
 
 ```go
 // Reset zeroes r field by field, not in one assignment:
-//   - Mu is a sync.Mutex, which must not be copied
+//   - zeroing all 2400 bytes and restoring 39 fields costs 314, resetting the 74 fields one by one costs 162
 ```
 
-When that happens the generator also says, on stderr, what would get bulk
-mode back — for each field, the change that would do it:
+and the generator says so on stderr too, with what would change the outcome:
 
 ```
-goreset: wrote state_reset.gen.go
-goreset: State is reset field by field; for one assignment:
-  - Big: tag it reset:"keep" to copy it across the assignment anyway (128 bytes, twice) and reset the rest of the struct in one go, or make it a *Big
-  - Mu: a sync.Mutex cannot be kept across the assignment; make it a *sync.Mutex (tagged reset:"-", so it is kept and never reset), or keep the lock outside the pooled value
+goreset: wrote reqvars_reset.gen.go
+goreset: ReqVars is reset field by field; for one assignment:
+  - ReqVars: one assignment would zero all 2400 bytes and restore 39 fields (cost 314) where resetting the 74 fields one by one costs 162; fewer slices and kept values, or a smaller struct, would turn that around
 ```
 
-Whether bulk mode is worth it is a measurement: one `memclr` of the struct
-plus two copies of the kept value, against one statement per field. For a
-struct with dozens of fields it usually is.
-
+For a lock the hint is to move it behind a pointer or out of the pooled value.
 [`Package.Analyze`](https://pkg.go.dev/github.com/darxnet/goreset#Package.Analyze)
-returns the same findings to other tools.
+returns the mode, both costs and the hints to other tools.
 
 ## Installation
 

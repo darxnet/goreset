@@ -11,9 +11,11 @@
 //	Flags uint32       `reset:"value=^uint32(0)"`  // set to EXPR, not zero
 //	Conn  *Conn        `reset:"release=PutConn"`   // PutConn(r.Conn); r.Conn = nil
 //
-// Fields of sync types are never touched; a struct holding one is reset
-// field by field, every other struct in one assignment (`*r = T{}`) with the
-// kept fields restored after it.
+// Fields of sync types are never touched, and a struct holding one is reset
+// field by field. Any other struct is reset either in one assignment
+// (`*r = T{}`) with the kept fields restored after it, or field by field,
+// whichever a cost model built on the field sizes rates cheaper; the
+// generated comment says which and why.
 //
 // The usual way to run it is a go:generate directive next to the type:
 //

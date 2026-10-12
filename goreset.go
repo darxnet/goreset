@@ -11,9 +11,23 @@ import (
 	"text/template"
 )
 
-// maxKeepSize is the largest value struct (bytes) that bulk mode keeps by copy:
-// a bigger one is cheaper to reset in place, so its type uses field-wise mode.
-const maxKeepSize = 64
+// The cost model behind the choice of mode, in units of one field store.
+//
+// Bulk mode zeroes the whole struct in one memclr and then puts the kept
+// fields back; field-wise mode writes each field on its own. Zeroing or
+// copying memory in bulk moves bytesPerUnit bytes for the cost of one field
+// store; the other constants count the statements each kind of field needs.
+// The constants were fitted on two real structs (one of 700 bytes and 95
+// fields where both modes measured equal, one of 2400 bytes and 74 fields
+// where field-wise was 2.5x faster) and are a model, not a measurement.
+const (
+	bytesPerUnit = 16 // memclr / memmove throughput relative to one field store
+
+	costStore   = 1 // r.F = 0, r.F = nil, r.F.Store(0), a Reset() call
+	costSlice   = 2 // clear(r.F); r.F = r.F[:0]
+	costKeep    = 2 // keepF := r.F ... r.F = keepF, around the bulk assignment
+	costSliceBK = 3 // clear(r.F); keepF := r.F[:0] ... r.F = keepF
+)
 
 // FileName is the file Generate's output is meant for: <type>_reset.gen.go, lower case.
 func FileName(typeName string) string {
@@ -28,11 +42,15 @@ type fieldInfo struct {
 	// empty Restore means the bulk zeroing already did the right thing.
 	Keep    string
 	Restore string
-	// NoBulk marks a field whose state cannot be kept cheaply across `*r = T{}`
-	// (a lock, or a big value struct with its own Reset): the type then uses
-	// field-wise mode, and Reason says why, in the generated comment.
-	NoBulk bool
-	Reason string
+	// Weight is the field's cost in field-wise mode; BulkExtra what it adds to
+	// bulk mode on top of the memclr (keep and restore around the assignment).
+	Weight    int
+	BulkExtra int
+	// Forbidden marks a field that cannot be kept across `*r = T{}` at all (a
+	// lock): the type then uses field-wise mode whatever the costs, and Reason
+	// says why in the generated comment.
+	Forbidden bool
+	Reason    string
 	// Hint says what would let the type keep bulk mode despite this field.
 	Hint string
 }
@@ -41,9 +59,13 @@ type fieldInfo struct {
 type Result struct {
 	// Source is the generated file, as Generate returns it.
 	Source []byte
-	// Hints say how the type could be reset in one assignment instead of
-	// field by field: one per field that rules bulk mode out. Empty when Bulk.
+	// Hints say why Reset is field by field and how it could be one
+	// assignment instead. Empty when Bulk.
 	Hints []string
+	// BulkCost and FieldwiseCost are the model's estimates for the two modes,
+	// in units of one field store; the cheaper one is generated.
+	BulkCost      int
+	FieldwiseCost int
 	// Bulk reports whether Reset is one assignment with the kept fields
 	// restored after it (true), or one statement per field (false).
 	Bulk bool
@@ -57,8 +79,8 @@ func (p *Package) Generate(typeName string) ([]byte, error) {
 	return res.Source, err
 }
 
-// Analyze is Generate with the findings behind the output: the mode, and for
-// field-wise mode, how to get bulk mode back.
+// Analyze is Generate with the findings behind the output: the mode, the
+// costs the model gave the two modes, and for field-wise mode, why.
 func (p *Package) Analyze(typeName string) (Result, error) {
 	var res Result
 
@@ -89,10 +111,11 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 
 		if tag == "-" {
 			fields = append(fields, fieldInfo{
-				Field:   f.Name(),
-				Code:    fmt.Sprintf("// r.%s skipped via tag", f.Name()),
-				Keep:    fmt.Sprintf("keep%s := r.%s", f.Name(), f.Name()),
-				Restore: fmt.Sprintf("r.%s = keep%s", f.Name(), f.Name()),
+				Field:     f.Name(),
+				Code:      fmt.Sprintf("// r.%s skipped via tag", f.Name()),
+				Keep:      fmt.Sprintf("keep%s := r.%s", f.Name(), f.Name()),
+				Restore:   fmt.Sprintf("r.%s = keep%s", f.Name(), f.Name()),
+				BulkExtra: costKeep,
 			})
 
 			continue
@@ -115,18 +138,20 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 			// value=EXPR resets the field to EXPR instead of the zero value,
 			// e.g. `reset:"value=^uint32(0)"`.
 			fields = append(fields, fieldInfo{
-				Field:   f.Name(),
-				Code:    fmt.Sprintf("r.%s = %s", f.Name(), opts.value),
-				Restore: fmt.Sprintf("r.%s = %s", f.Name(), opts.value),
+				Field:     f.Name(),
+				Code:      fmt.Sprintf("r.%s = %s", f.Name(), opts.value),
+				Restore:   fmt.Sprintf("r.%s = %s", f.Name(), opts.value),
+				Weight:    costStore,
+				BulkExtra: costStore,
 			})
 
 		default:
-			fields = append(fields, p.resetCode(f, opts))
+			fields = append(fields, p.resetCode(f, opts.release))
 		}
 	}
 
-	for _, f := range fields {
-		if f.Import != "" {
+	for i := range fields {
+		if f := &fields[i]; f.Import != "" {
 			imports = append(imports, f.Import)
 		}
 	}
@@ -138,17 +163,43 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 	// Bulk mode zeroes the struct in one assignment and restores the fields
 	// that keep state (slices keep their arrays, tagged fields keep their
 	// values). It is used unless a field is cheaper to reset in place.
-	var reasons []string
+	// The costs of the two modes; a lock rules bulk mode out whatever they say.
+	var (
+		reasons   []string
+		forbidden bool
+		kept      int
+	)
 
-	for _, f := range fields {
-		if f.NoBulk {
+	structSize := p.sizes.Sizeof(obj.Type())
+	res.BulkCost = units(structSize)
+
+	for i := range fields {
+		f := &fields[i]
+		res.FieldwiseCost += f.Weight
+		res.BulkCost += f.BulkExtra
+
+		if f.BulkExtra != 0 {
+			kept++
+		}
+
+		if f.Forbidden {
+			forbidden = true
 			reasons = append(reasons, f.Reason)
 			res.Hints = append(res.Hints, f.Hint)
 		}
 	}
 
-	bulk := len(reasons) == 0
+	bulk := !forbidden && res.BulkCost <= res.FieldwiseCost
 	res.Bulk = bulk
+
+	if !bulk && !forbidden {
+		reasons = append(reasons, fmt.Sprintf("zeroing all %d bytes and restoring %d fields costs %d, "+
+			"resetting the %d fields one by one costs %d", structSize, kept, res.BulkCost, len(fields), res.FieldwiseCost))
+		res.Hints = append(res.Hints, fmt.Sprintf("%s: one assignment would zero all %d bytes and restore %d fields "+
+			"(cost %d) where resetting the %d fields one by one costs %d; fewer slices and kept values, "+
+			"or a smaller struct, would turn that around",
+			typeName, structSize, kept, res.BulkCost, len(fields), res.FieldwiseCost))
+	}
 
 	if bulk {
 		// see tagImports: field-type imports are unused by bulk code
@@ -193,9 +244,6 @@ type tagOptions struct {
 	release    string
 	call       string
 	value      string
-	// keep copies a value with Reset across the bulk assignment whatever its
-	// size, instead of switching the type to field-wise mode: `reset:"keep"`.
-	keep bool
 }
 
 func parseTag(tag string) tagOptions {
@@ -203,8 +251,6 @@ func parseTag(tag string) tagOptions {
 
 	for part := range strings.SplitSeq(tag, ",") {
 		switch {
-		case part == "keep":
-			opts.keep = true
 		case cut(part, "import=", &opts.importPath),
 			cut(part, "release=", &opts.release),
 			cut(part, "call=", &opts.call),
@@ -225,9 +271,7 @@ func cut(part, prefix string, dst *string) bool {
 	return ok
 }
 
-func (p *Package) resetCode(f *types.Var, opts tagOptions) fieldInfo {
-	release := opts.release
-
+func (p *Package) resetCode(f *types.Var, release string) fieldInfo {
 	var (
 		info       fieldInfo
 		importPath string
@@ -246,6 +290,8 @@ func (p *Package) resetCode(f *types.Var, opts tagOptions) fieldInfo {
 	info.Field = f.Name()
 	typeName := types.TypeString(f.Type(), qualifier)
 
+	info.Weight = costStore // the common case: one statement, nothing to keep
+
 	if strings.HasPrefix(typeName, "atomic.") {
 		switch {
 		case strings.HasPrefix(typeName, "atomic.Pointer"):
@@ -262,7 +308,8 @@ func (p *Package) resetCode(f *types.Var, opts tagOptions) fieldInfo {
 
 	if isForbidden(typeName) {
 		info.Code = fmt.Sprintf("// r.%s (type %s) skip forbidden", info.Field, typeName)
-		info.NoBulk = true // a lock cannot be kept by value
+		info.Weight = 0
+		info.Forbidden = true // a lock cannot be kept by value
 		info.Reason = fmt.Sprintf("%s is a %s, which must not be copied", info.Field, typeName)
 		info.Hint = fmt.Sprintf("%s: a %s cannot be kept across the assignment; make it a *%s "+
 			"(tagged reset:\"-\", so it is kept and never reset), or keep the lock outside the pooled value",
@@ -276,6 +323,8 @@ func (p *Package) resetCode(f *types.Var, opts tagOptions) fieldInfo {
 			if release != "" {
 				info.Code = fmt.Sprintf("if r.%s != nil { %s(r.%s); r.%s = nil }", info.Field, release, info.Field, info.Field)
 				info.Keep = fmt.Sprintf("if r.%s != nil { %s(r.%s) }", info.Field, release, info.Field)
+				info.Weight = costSlice // the call and the nil store
+				info.BulkExtra = costStore
 
 				return info
 			}
@@ -283,27 +332,18 @@ func (p *Package) resetCode(f *types.Var, opts tagOptions) fieldInfo {
 			info.Code = fmt.Sprintf("if r.%s != nil { r.%s.Reset() }", info.Field, info.Field)
 			info.Keep = fmt.Sprintf("keep%s := r.%s", info.Field, info.Field)
 			info.Restore = fmt.Sprintf("r.%s = keep%s\n\t%s", info.Field, info.Field, info.Code)
+			info.BulkExtra = costKeep
 
 			return info
 		}
 
+		// A value with Reset is kept across the zeroing: copied out and back,
+		// then reset in place. Both modes pay the Reset call; bulk mode pays
+		// the two copies on top, and the model weighs that against the memclr.
 		info.Code = fmt.Sprintf("r.%s.Reset()", info.Field)
-
-		// Keeping a value struct across the zeroing copies it twice; that is
-		// fine for small ones, a large one is cheaper to reset in place —
-		// unless the field says reset:"keep", and the rest of the struct gets
-		// its one assignment.
-		if size := p.sizes.Sizeof(f.Type()); size <= maxKeepSize || opts.keep {
-			info.Keep = fmt.Sprintf("keep%s := r.%s", info.Field, info.Field)
-			info.Restore = fmt.Sprintf("r.%s = keep%s\n\tr.%s.Reset()", info.Field, info.Field, info.Field)
-		} else {
-			info.NoBulk = true
-			info.Reason = fmt.Sprintf("%s (%d bytes, has Reset) is cheaper to reset in place than to copy twice",
-				info.Field, size)
-			info.Hint = fmt.Sprintf("%s: tag it reset:\"keep\" to copy it across the assignment anyway "+
-				"(%d bytes, twice) and reset the rest of the struct in one go, or make it a *%s",
-				info.Field, size, typeName)
-		}
+		info.Keep = fmt.Sprintf("keep%s := r.%s", info.Field, info.Field)
+		info.Restore = fmt.Sprintf("r.%s = keep%s\n\tr.%s.Reset()", info.Field, info.Field, info.Field)
+		info.BulkExtra = costKeep + 2*units(p.sizes.Sizeof(f.Type()))
 
 		return info
 	}
@@ -313,6 +353,8 @@ func (p *Package) resetCode(f *types.Var, opts tagOptions) fieldInfo {
 		info.Code = fmt.Sprintf("clear(r.%s)\nr.%s = r.%s[:0]", info.Field, info.Field, info.Field)
 		info.Keep = fmt.Sprintf("clear(r.%s)\n\tkeep%s := r.%s[:0]", info.Field, info.Field, info.Field)
 		info.Restore = fmt.Sprintf("r.%s = keep%s", info.Field, info.Field)
+		info.Weight = costSlice
+		info.BulkExtra = costSliceBK
 
 		return info
 
@@ -334,15 +376,21 @@ func (p *Package) resetCode(f *types.Var, opts tagOptions) fieldInfo {
 		return info
 	}
 
-	// arrays and structs without Reset: assign the zero value
+	// arrays and structs without Reset: assign the zero value, a memclr of the field
 	info.Import = importPath
 	info.Code = fmt.Sprintf("r.%s = %s{}", info.Field, typeName)
+	info.Weight = units(p.sizes.Sizeof(f.Type()))
 
 	return info
 }
 
+// units is the cost of zeroing or copying size bytes in bulk.
+func units(size int64) int {
+	return max(1, int((size+bytesPerUnit-1)/bytesPerUnit))
+}
+
 func callCode(f *types.Var, method string) fieldInfo {
-	info := fieldInfo{Field: f.Name()}
+	info := fieldInfo{Field: f.Name(), Weight: costStore, BulkExtra: costKeep}
 	info.Keep = fmt.Sprintf("keep%s := r.%s", info.Field, info.Field)
 
 	if _, ok := f.Type().Underlying().(*types.Pointer); ok {
