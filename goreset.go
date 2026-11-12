@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"go/format"
 	"go/types"
+	"path"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"text/template"
 )
@@ -35,9 +37,10 @@ func FileName(typeName string) string {
 }
 
 type fieldInfo struct {
-	Import string
-	Field  string
-	Code   string // field-wise reset
+	// Imports are the paths of the packages Code names.
+	Imports []string
+	Field   string
+	Code    string // field-wise reset
 	// bulk mode: Keep runs before `*r = T{}`, Restore after. Empty Keep with
 	// empty Restore means the bulk zeroing already did the right thing.
 	Keep    string
@@ -103,20 +106,35 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 		// asks for through import=, e.g. `reset:"value=consts.Default,import=example.com/consts"`.
 		tagImports []string
 		fields     []fieldInfo
+		names      = importNames{byPath: map[string]string{}, byName: map[string]string{}, own: map[string]string{}}
 	)
+
+	// a value= expression names its import= package by the package's own
+	// name, so those names are taken first; field types get the rest
+	for i := range structType.NumFields() {
+		if imp := parseTag(reflect.StructTag(structType.Tag(i)).Get("reset")).importPath; imp != "" {
+			names.name(imp, path.Base(imp))
+		}
+	}
 
 	for i := range structType.NumFields() {
 		f := structType.Field(i)
+		if f.Name() == "_" {
+			continue // padding: it cannot be referred to, and nothing reads it
+		}
+
 		tag := reflect.StructTag(structType.Tag(i)).Get("reset")
 
 		if tag == "-" {
-			fields = append(fields, fieldInfo{
+			info := fieldInfo{
 				Field:     f.Name(),
 				Code:      fmt.Sprintf("// r.%s skipped via tag", f.Name()),
 				Keep:      fmt.Sprintf("keep%s := r.%s", f.Name(), f.Name()),
 				Restore:   fmt.Sprintf("r.%s = keep%s", f.Name(), f.Name()),
 				BulkExtra: costKeep,
-			})
+			}
+			p.forbidCopy(&info, f.Type())
+			fields = append(fields, info)
 
 			continue
 		}
@@ -132,7 +150,9 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 		case opts.call != "":
 			// call=Method keeps the field value and calls its method instead,
 			// e.g. `reset:"call=Stop"` for a reusable *time.Timer.
-			fields = append(fields, callCode(f, opts.call))
+			info := callCode(f, opts.call)
+			p.forbidCopy(&info, f.Type())
+			fields = append(fields, info)
 
 		case opts.value != "":
 			// value=EXPR resets the field to EXPR instead of the zero value,
@@ -146,14 +166,12 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 			})
 
 		default:
-			fields = append(fields, p.resetCode(f, opts.release))
+			fields = append(fields, p.resetCode(f, opts.release, &names))
 		}
 	}
 
 	for i := range fields {
-		if f := &fields[i]; f.Import != "" {
-			imports = append(imports, f.Import)
-		}
+		imports = append(imports, fields[i].Imports...)
 	}
 
 	slices.SortFunc(fields, func(a, b fieldInfo) int {
@@ -207,6 +225,9 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 	}
 
 	imports = slices.Compact(slices.Sorted(slices.Values(imports)))
+	for i, path := range imports {
+		imports[i] = names.spec(path)
+	}
 
 	data := struct {
 		PackageName string
@@ -271,10 +292,10 @@ func cut(part, prefix string, dst *string) bool {
 	return ok
 }
 
-func (p *Package) resetCode(f *types.Var, release string) fieldInfo {
+func (p *Package) resetCode(f *types.Var, release string, names *importNames) fieldInfo {
 	var (
-		info       fieldInfo
-		importPath string
+		info    fieldInfo
+		imports []string
 	)
 
 	qualifier := func(other *types.Package) string {
@@ -282,9 +303,9 @@ func (p *Package) resetCode(f *types.Var, release string) fieldInfo {
 			return ""
 		}
 
-		importPath = other.Path()
+		imports = append(imports, other.Path())
 
-		return other.Name()
+		return names.name(other.Path(), other.Name())
 	}
 
 	info.Field = f.Name()
@@ -292,11 +313,14 @@ func (p *Package) resetCode(f *types.Var, release string) fieldInfo {
 
 	info.Weight = costStore // the common case: one statement, nothing to keep
 
-	if strings.HasPrefix(typeName, "atomic.") {
-		switch {
-		case strings.HasPrefix(typeName, "atomic.Pointer"):
+	// The sync/atomic types are stored to, but Value is zeroed by the
+	// assignment below: its Store panics on nil and on a type other than
+	// the one stored before, so it has no zero to store.
+	if atomicName := syncAtomicName(f.Type()); atomicName != "" && atomicName != "Value" {
+		switch atomicName {
+		case "Pointer":
 			info.Code = fmt.Sprintf("r.%s.Store(nil)", info.Field)
-		case typeName == "atomic.Bool":
+		case "Bool":
 			info.Code = fmt.Sprintf("r.%s.Store(false)", info.Field)
 		default:
 			info.Code = fmt.Sprintf("r.%s.Store(0)", info.Field)
@@ -318,7 +342,9 @@ func (p *Package) resetCode(f *types.Var, release string) fieldInfo {
 		return info
 	}
 
-	if hasResetMethod(f.Type()) {
+	// An interface is set to nil even when its method set has Reset: the
+	// call would panic on a nil value and keep a non-nil one.
+	if _, ok := f.Type().Underlying().(*types.Interface); !ok && hasResetMethod(f.Type()) {
 		if _, ok := f.Type().(*types.Pointer); ok {
 			if release != "" {
 				info.Code = fmt.Sprintf("if r.%s != nil { %s(r.%s); r.%s = nil }", info.Field, release, info.Field, info.Field)
@@ -344,14 +370,22 @@ func (p *Package) resetCode(f *types.Var, release string) fieldInfo {
 		info.Keep = fmt.Sprintf("keep%s := r.%s", info.Field, info.Field)
 		info.Restore = fmt.Sprintf("r.%s = keep%s\n\tr.%s.Reset()", info.Field, info.Field, info.Field)
 		info.BulkExtra = costKeep + 2*units(p.sizes.Sizeof(f.Type()))
+		p.forbidCopy(&info, f.Type())
 
 		return info
 	}
 
 	switch ut := f.Type().Underlying().(type) {
 	case *types.Slice:
-		info.Code = fmt.Sprintf("clear(r.%s)\nr.%s = r.%s[:0]", info.Field, info.Field, info.Field)
-		info.Keep = fmt.Sprintf("clear(r.%s)\n\tkeep%s := r.%s[:0]", info.Field, info.Field, info.Field)
+		// Elements past len(s) that hold pointers keep their memory alive
+		// until the slice grows over them: clear those up to cap(s).
+		cleared := "r." + info.Field
+		if hasPointers(ut.Elem()) {
+			cleared = fmt.Sprintf("r.%s[:cap(r.%s)]", info.Field, info.Field)
+		}
+
+		info.Code = fmt.Sprintf("clear(%s)\nr.%s = r.%s[:0]", cleared, info.Field, info.Field)
+		info.Keep = fmt.Sprintf("clear(%s)\n\tkeep%s := r.%s[:0]", cleared, info.Field, info.Field)
 		info.Restore = fmt.Sprintf("r.%s = keep%s", info.Field, info.Field)
 		info.Weight = costSlice
 		info.BulkExtra = costSliceBK
@@ -369,19 +403,88 @@ func (p *Package) resetCode(f *types.Var, release string) fieldInfo {
 			info.Code = fmt.Sprintf("r.%s = 0", info.Field)
 		case ut.Info()&types.IsBoolean != 0:
 			info.Code = fmt.Sprintf("r.%s = false", info.Field)
-		default: // string
+		case ut.Info()&types.IsString != 0:
 			info.Code = fmt.Sprintf("r.%s = \"\"", info.Field)
+		default: // unsafe.Pointer
+			info.Code = fmt.Sprintf("r.%s = nil", info.Field)
 		}
 
 		return info
 	}
 
 	// arrays and structs without Reset: assign the zero value, a memclr of the field
-	info.Import = importPath
+	info.Imports = imports
 	info.Code = fmt.Sprintf("r.%s = %s{}", info.Field, typeName)
 	info.Weight = units(p.sizes.Sizeof(f.Type()))
 
 	return info
+}
+
+// hasPointers reports whether a value of type t holds a pointer the garbage
+// collector follows: a string, a pointer, a slice, a map, a channel, a func,
+// an interface, or an array or struct with one of those.
+func hasPointers(t types.Type) bool {
+	switch ut := t.Underlying().(type) {
+	case *types.Basic:
+		return ut.Info()&types.IsString != 0 || ut.Kind() == types.UnsafePointer
+	case *types.Array:
+		return hasPointers(ut.Elem())
+	case *types.Struct:
+		for field := range ut.Fields() {
+			if hasPointers(field.Type()) {
+				return true
+			}
+		}
+
+		return false
+	default:
+		return true
+	}
+}
+
+// syncAtomicName is the name of t when t is a type of sync/atomic, "" if not.
+func syncAtomicName(t types.Type) string {
+	named, ok := types.Unalias(t).(*types.Named)
+	if !ok || named.Obj().Pkg() == nil || named.Obj().Pkg().Path() != "sync/atomic" {
+		return ""
+	}
+
+	return named.Obj().Name()
+}
+
+// importNames gives every package the generated code names a name of its
+// own: the package name, or, when another package has it already, that
+// name with a number appended (atomic, atomic2).
+type importNames struct {
+	byPath map[string]string // import path → name in the generated file
+	byName map[string]string // name → import path
+	own    map[string]string // import path → package name
+}
+
+// name returns the name of the package at importPath, whose own name is own.
+func (n *importNames) name(importPath, own string) string {
+	if name, ok := n.byPath[importPath]; ok {
+		return name
+	}
+
+	name := own
+	for i := 2; n.byName[name] != ""; i++ {
+		name = own + strconv.Itoa(i)
+	}
+
+	n.byPath[importPath], n.byName[name], n.own[importPath] = name, importPath, own
+
+	return name
+}
+
+// spec is the import line for importPath: quoted, with the name in front when it
+// is not the package's own.
+func (n *importNames) spec(importPath string) string {
+	if name := n.byPath[importPath]; name != n.own[importPath] {
+		return name + " " + strconv.Quote(importPath)
+	}
+
+	return strconv.Quote(importPath)
 }
 
 // units is the cost of zeroing or copying size bytes in bulk.
@@ -393,9 +496,10 @@ func callCode(f *types.Var, method string) fieldInfo {
 	info := fieldInfo{Field: f.Name(), Weight: costStore, BulkExtra: costKeep}
 	info.Keep = fmt.Sprintf("keep%s := r.%s", info.Field, info.Field)
 
-	if _, ok := f.Type().Underlying().(*types.Pointer); ok {
+	switch f.Type().Underlying().(type) {
+	case *types.Pointer, *types.Interface:
 		info.Code = fmt.Sprintf("if r.%s != nil { r.%s.%s() }", info.Field, info.Field, method)
-	} else {
+	default:
 		info.Code = fmt.Sprintf("r.%s.%s()", info.Field, method)
 	}
 
@@ -411,8 +515,75 @@ func isForbidden(typeName string) bool {
 	return strings.HasPrefix(typeName, "sync.")
 }
 
+// forbidCopy rules bulk mode out for a field that bulk mode keeps by copy
+// (reset:"-", call=, a value with Reset) when its value holds a lock.
+func (p *Package) forbidCopy(info *fieldInfo, t types.Type) {
+	lock := heldLock(t)
+	if lock == "" {
+		return
+	}
+
+	typeName := types.TypeString(t, types.RelativeTo(p.pkg))
+	info.Forbidden = true
+	info.Reason = fmt.Sprintf("%s holds a %s, which bulk mode would copy", info.Field, lock)
+	info.Hint = fmt.Sprintf("%s: a %s holds a %s, so it cannot be kept across the assignment; "+
+		"make the field a pointer, or keep the lock outside the pooled value", info.Field, typeName, lock)
+}
+
+// heldLock names the lock a value of type t holds, "" if none: a type of
+// sync or sync/atomic, or, as go vet's copylocks check sees it, a struct
+// whose pointer is a sync.Locker and whose value is not. Pointers,
+// interfaces and the like hold nothing; arrays and struct fields are
+// searched (a struct cannot hold itself by value, so this ends).
+func heldLock(t types.Type) string {
+	for {
+		arr, ok := t.Underlying().(*types.Array)
+		if !ok {
+			break
+		}
+
+		t = arr.Elem()
+	}
+
+	st, ok := t.Underlying().(*types.Struct)
+	if !ok {
+		return ""
+	}
+
+	if named, ok := types.Unalias(t).(*types.Named); ok && named.Obj().Pkg() != nil {
+		switch named.Obj().Pkg().Path() {
+		case "sync", "sync/atomic":
+			return types.TypeString(named, func(p *types.Package) string { return p.Name() })
+		}
+	}
+
+	if isLocker(types.NewPointer(t)) && !isLocker(t) {
+		return types.TypeString(t, func(p *types.Package) string { return p.Name() })
+	}
+
+	for field := range st.Fields() {
+		if lock := heldLock(field.Type()); lock != "" {
+			return lock
+		}
+	}
+
+	return ""
+}
+
+// isLocker reports whether t has Lock() and Unlock() methods.
+func isLocker(t types.Type) bool {
+	return hasNiladicMethod(t, false, "Lock") && hasNiladicMethod(t, false, "Unlock")
+}
+
+// hasResetMethod reports whether r.F.Reset() compiles for a field of type t.
 func hasResetMethod(t types.Type) bool {
-	meth, _, _ := types.LookupFieldOrMethod(t, true, nil, "Reset")
+	return hasNiladicMethod(t, true, "Reset")
+}
+
+// hasNiladicMethod reports whether t has a method name without parameters
+// and results; addressable counts the methods of *t too.
+func hasNiladicMethod(t types.Type, addressable bool, name string) bool {
+	meth, _, _ := types.LookupFieldOrMethod(t, addressable, nil, name)
 	if meth == nil {
 		return false
 	}
@@ -430,7 +601,7 @@ package {{.PackageName}}
 
 import (
 {{- range .Imports}}
-	"{{.}}"
+	{{.}}
 {{- end}}
 )
 {{- end}}

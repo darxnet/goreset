@@ -40,13 +40,14 @@ func (r *Request) Reset() {
 
 | Field | Reset |
 |---|---|
-| slice | `clear(s); s = s[:0]` — the backing array is kept |
-| pointer, map, chan, interface, func | `nil` |
+| slice | `clear(s); s = s[:0]` — the backing array is kept; when the elements hold pointers, `clear(s[:cap(s)])`, so the array keeps nothing alive |
+| pointer, `unsafe.Pointer`, map, chan, interface, func | `nil` (an interface too when its methods include `Reset()`) |
 | numbers, bool, string, arrays, plain structs | zero value |
 | value with its own `Reset()` | `r.F.Reset()` |
 | pointer with its own `Reset()` | kept; `r.F.Reset()` when not nil |
-| `atomic.*` | `Store(0)` / `Store(false)` / `Store(nil)` |
+| `sync/atomic` types | `Store(0)` / `Store(false)` / `Store(nil)`; `atomic.Value` is set to its zero value |
 | `sync.*` (Mutex, WaitGroup, Pool...) | left alone |
+| `_` (padding) | left out: field by field it is not touched, bulk mode zeroes it |
 
 Struct tags change the treatment of a field:
 
@@ -79,7 +80,9 @@ The mode is chosen per type by a cost model, in units of one field store:
 | array, struct without `Reset()` | 0 | 1 per 16 bytes |
 
 The cheaper mode is generated; a `sync` field forces field-wise mode whatever
-the costs. The constants were fitted on two real structs (700 bytes / 95
+the costs, and so does a field bulk mode would keep by copy (`reset:"-"`,
+`call=` on a value, a value with `Reset()`) whose value holds a lock: a
+`sync` or `sync/atomic` value, or a type `go vet` treats as a lock. The constants were fitted on two real structs (700 bytes / 95
 fields: both modes equal; 2400 bytes / 74 fields: field-wise 2.5x faster) —
 a model, not a measurement, so a struct near the break-even point is worth a
 benchmark of its own.
