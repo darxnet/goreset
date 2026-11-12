@@ -389,3 +389,80 @@ func TestReset(t *testing.T) {
 		t.Errorf("Bulk is not reset in one assignment:\n%s", srcs["Bulk"])
 	}
 }
+
+// TestBlankAndUnsafe: blank fields (padding) cannot be referred to and are
+// left out; an unsafe.Pointer is set to nil; a field type that names several
+// packages imports all of them.
+func TestBlankAndUnsafe(t *testing.T) {
+	t.Parallel()
+
+	srcs := checkGenerated(t, "blank", map[string]string{
+		"m.go": `package m
+
+import (
+	"net/netip"
+	"sync"
+	"time"
+	"unsafe"
+)
+
+type Pad struct{ n int }
+
+func (p *Pad) Reset() { p.n = 0 }
+
+type Bulk struct {
+	_ [8]byte ` + "`" + `reset:"-"` + "`" + `
+	_ Pad
+	P unsafe.Pointer
+	N int
+}
+
+type Fieldwise struct {
+	Mu sync.Mutex
+	_  [56]byte
+	_  Pad
+	P  unsafe.Pointer
+	A  [1]map[netip.Addr]time.Time
+}
+`,
+		"m_test.go": `package m
+
+import (
+	"net/netip"
+	"testing"
+	"time"
+	"unsafe"
+)
+
+func TestReset(t *testing.T) {
+	x := 1
+
+	b := Bulk{P: unsafe.Pointer(&x), N: 1}
+	b.Reset()
+
+	if b.P != nil || b.N != 0 {
+		t.Fatalf("Bulk = %+v, want zero", b)
+	}
+
+	var f Fieldwise
+	f.P = unsafe.Pointer(&x)
+	f.A[0] = map[netip.Addr]time.Time{}
+	f.Reset()
+
+	if f.P != nil || f.A[0] != nil {
+		t.Fatal("Fieldwise: P and A are not zero")
+	}
+}
+`,
+	}, "Bulk", "Fieldwise")
+
+	for typeName, src := range srcs {
+		if strings.Contains(src, "r._") {
+			t.Errorf("%s refers to a blank field:\n%s", typeName, src)
+		}
+	}
+
+	if !strings.Contains(srcs["Bulk"], "*r = Bulk{}") {
+		t.Errorf("Bulk is not reset in one assignment:\n%s", srcs["Bulk"])
+	}
+}

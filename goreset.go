@@ -119,6 +119,10 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 
 	for i := range structType.NumFields() {
 		f := structType.Field(i)
+		if f.Name() == "_" {
+			continue // padding: it cannot be referred to, and nothing reads it
+		}
+
 		tag := reflect.StructTag(structType.Tag(i)).Get("reset")
 
 		if tag == "-" {
@@ -399,8 +403,10 @@ func (p *Package) resetCode(f *types.Var, release string, names *importNames) fi
 			info.Code = fmt.Sprintf("r.%s = 0", info.Field)
 		case ut.Info()&types.IsBoolean != 0:
 			info.Code = fmt.Sprintf("r.%s = false", info.Field)
-		default: // string
+		case ut.Info()&types.IsString != 0:
 			info.Code = fmt.Sprintf("r.%s = \"\"", info.Field)
+		default: // unsafe.Pointer
+			info.Code = fmt.Sprintf("r.%s = nil", info.Field)
 		}
 
 		return info

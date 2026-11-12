@@ -41,12 +41,13 @@ func (r *Request) Reset() {
 | Field | Reset |
 |---|---|
 | slice | `clear(s); s = s[:0]` — the backing array is kept; when the elements hold pointers, `clear(s[:cap(s)])`, so the array keeps nothing alive |
-| pointer, map, chan, interface, func | `nil` (an interface too when its methods include `Reset()`) |
+| pointer, `unsafe.Pointer`, map, chan, interface, func | `nil` (an interface too when its methods include `Reset()`) |
 | numbers, bool, string, arrays, plain structs | zero value |
 | value with its own `Reset()` | `r.F.Reset()` |
 | pointer with its own `Reset()` | kept; `r.F.Reset()` when not nil |
 | `sync/atomic` types | `Store(0)` / `Store(false)` / `Store(nil)`; `atomic.Value` is set to its zero value |
 | `sync.*` (Mutex, WaitGroup, Pool...) | left alone |
+| `_` (padding) | left out: field by field it is not touched, bulk mode zeroes it |
 
 Struct tags change the treatment of a field:
 
