@@ -40,7 +40,7 @@ func (r *Request) Reset() {
 
 | Field | Reset |
 |---|---|
-| slice | `clear(s); s = s[:0]` — the backing array is kept |
+| slice | `clear(s); s = s[:0]` — the backing array is kept; when the elements hold pointers, `clear(s[:cap(s)])`, so the array keeps nothing alive |
 | pointer, map, chan, interface, func | `nil` (an interface too when its methods include `Reset()`) |
 | numbers, bool, string, arrays, plain structs | zero value |
 | value with its own `Reset()` | `r.F.Reset()` |

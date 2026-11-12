@@ -18,7 +18,7 @@ func (r *Request) Reset() {
 	keepDim := r.Dim
 	keepDimPtr := r.DimPtr
 	keepKeep := r.Keep
-	clear(r.Names)
+	clear(r.Names[:cap(r.Names)])
 	keepNames := r.Names[:0]
 	keepTimer := r.Timer
 

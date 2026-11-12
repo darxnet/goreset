@@ -306,3 +306,86 @@ func TestReset(t *testing.T) {
 		}
 	}
 }
+
+// TestSliceTailCleared: a slice of pointer-bearing elements is cleared up to
+// its capacity, so the elements past its length do not keep memory alive;
+// a slice of plain values is cleared up to its length only.
+func TestSliceTailCleared(t *testing.T) {
+	t.Parallel()
+
+	srcs := checkGenerated(t, "tail", map[string]string{
+		"m.go": `package m
+
+import (
+	"sync"
+	"unsafe"
+)
+
+type Elem struct {
+	N    int
+	Name string
+}
+
+type Bulk struct {
+	P []*int
+	E []Elem
+	B []byte
+
+	N0, N1, N2, N3, N4, N5, N6, N7, N8, N9, N10, N11, N12, N13, N14, N15 uint8
+}
+
+type Fieldwise struct {
+	Mu sync.Mutex
+	P  []*int
+	E  []Elem
+	B  []byte
+	D  []struct{ W, H int }
+	Q  [][2]uintptr
+	U  [][1]unsafe.Pointer
+}
+`,
+		"m_test.go": `package m
+
+import "testing"
+
+func TestReset(t *testing.T) {
+	x := 1
+	p := []*int{&x, &x}
+	e := []Elem{{1, "a"}, {2, "b"}}
+
+	b := Bulk{P: p[:1], E: e[:1], B: []byte("ab")}
+	b.Reset()
+
+	if p[0] != nil || p[1] != nil || e[1] != (Elem{}) || len(b.P) != 0 || cap(b.P) != 2 {
+		t.Fatalf("Bulk: %v %v, want the arrays cleared to their capacity", p, e)
+	}
+
+	p, e = []*int{&x, &x}, []Elem{{1, "a"}, {2, "b"}}
+
+	var f Fieldwise
+	f.P, f.E = p[:1], e[:1]
+	f.Reset()
+
+	if p[0] != nil || p[1] != nil || e[1] != (Elem{}) || len(f.P) != 0 || cap(f.P) != 2 {
+		t.Fatalf("Fieldwise: %v %v, want the arrays cleared to their capacity", p, e)
+	}
+}
+`,
+	}, "Bulk", "Fieldwise")
+
+	for typeName, src := range srcs {
+		if !strings.Contains(src, "clear(r.P[:cap(r.P)])") || !strings.Contains(src, "clear(r.B)\n") {
+			t.Errorf("%s: want P cleared to its capacity, B to its length:\n%s", typeName, src)
+		}
+	}
+
+	for _, want := range []string{"clear(r.D)\n", "clear(r.Q)\n", "clear(r.U[:cap(r.U)])"} {
+		if !strings.Contains(srcs["Fieldwise"], want) {
+			t.Errorf("Fieldwise lacks %q:\n%s", want, srcs["Fieldwise"])
+		}
+	}
+
+	if !strings.Contains(srcs["Bulk"], "*r = Bulk{}") {
+		t.Errorf("Bulk is not reset in one assignment:\n%s", srcs["Bulk"])
+	}
+}

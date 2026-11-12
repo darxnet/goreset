@@ -373,8 +373,15 @@ func (p *Package) resetCode(f *types.Var, release string, names *importNames) fi
 
 	switch ut := f.Type().Underlying().(type) {
 	case *types.Slice:
-		info.Code = fmt.Sprintf("clear(r.%s)\nr.%s = r.%s[:0]", info.Field, info.Field, info.Field)
-		info.Keep = fmt.Sprintf("clear(r.%s)\n\tkeep%s := r.%s[:0]", info.Field, info.Field, info.Field)
+		// Elements past len(s) that hold pointers keep their memory alive
+		// until the slice grows over them: clear those up to cap(s).
+		cleared := "r." + info.Field
+		if hasPointers(ut.Elem()) {
+			cleared = fmt.Sprintf("r.%s[:cap(r.%s)]", info.Field, info.Field)
+		}
+
+		info.Code = fmt.Sprintf("clear(%s)\nr.%s = r.%s[:0]", cleared, info.Field, info.Field)
+		info.Keep = fmt.Sprintf("clear(%s)\n\tkeep%s := r.%s[:0]", cleared, info.Field, info.Field)
 		info.Restore = fmt.Sprintf("r.%s = keep%s", info.Field, info.Field)
 		info.Weight = costSlice
 		info.BulkExtra = costSliceBK
@@ -405,6 +412,28 @@ func (p *Package) resetCode(f *types.Var, release string, names *importNames) fi
 	info.Weight = units(p.sizes.Sizeof(f.Type()))
 
 	return info
+}
+
+// hasPointers reports whether a value of type t holds a pointer the garbage
+// collector follows: a string, a pointer, a slice, a map, a channel, a func,
+// an interface, or an array or struct with one of those.
+func hasPointers(t types.Type) bool {
+	switch ut := t.Underlying().(type) {
+	case *types.Basic:
+		return ut.Info()&types.IsString != 0 || ut.Kind() == types.UnsafePointer
+	case *types.Array:
+		return hasPointers(ut.Elem())
+	case *types.Struct:
+		for field := range ut.Fields() {
+			if hasPointers(field.Type()) {
+				return true
+			}
+		}
+
+		return false
+	default:
+		return true
+	}
 }
 
 // syncAtomicName is the name of t when t is a type of sync/atomic, "" if not.
