@@ -48,6 +48,7 @@ func (r *Request) Reset() {
 | `sync/atomic` types | `Store(0)` / `Store(false)` / `Store(nil)`; `atomic.Value` is set to its zero value |
 | `sync.*` (Mutex, WaitGroup, Pool...) | left alone |
 | `_` (padding) | left out: field by field it is not touched, bulk mode zeroes it |
+| type parameter `T` | `*new(T)`, its zero value, whatever its constraint |
 
 Struct tags change the treatment of a field:
 
@@ -145,6 +146,10 @@ for tools that want the source without the file.
   handled by hand, or released through `release=`.
 - A nested value's `Reset()` is called after the bulk assignment, so it sees
   its own state, not zeroes.
+- A generic struct gets one `Reset` for all its instantiations
+  (`func (r *Pair[K, V]) Reset()`). The cost model sizes each type parameter
+  as one pointer, so the choice of mode is a guess for the instantiations
+  that are much larger.
 
 ## See also
 

@@ -97,6 +97,11 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 		return res, fmt.Errorf("goreset: %s is not a struct", typeName)
 	}
 
+	typeExpr, sized, err := p.generic(obj, structType)
+	if err != nil {
+		return res, err
+	}
+
 	var (
 		imports []string
 		// tagImports come from `reset:"import=..."` tags. Field-wise code names
@@ -166,7 +171,7 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 			})
 
 		default:
-			fields = append(fields, p.resetCode(f, opts.release, &names))
+			fields = append(fields, p.resetCode(f, sized.Field(i).Type(), opts.release, &names))
 		}
 	}
 
@@ -188,7 +193,7 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 		kept      int
 	)
 
-	structSize := p.sizes.Sizeof(obj.Type())
+	structSize := p.sizes.Sizeof(sized)
 	res.BulkCost = units(structSize)
 
 	for i := range fields {
@@ -232,6 +237,7 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 	data := struct {
 		PackageName string
 		TypeName    string
+		TypeExpr    string
 		Fields      []fieldInfo
 		Imports     []string
 		Reasons     []string
@@ -239,6 +245,7 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 	}{
 		PackageName: p.pkg.Name(),
 		TypeName:    typeName,
+		TypeExpr:    typeExpr,
 		Fields:      fields,
 		Imports:     imports,
 		Reasons:     reasons,
@@ -246,7 +253,7 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 	}
 
 	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, data); err != nil {
+	if err = tmpl.Execute(&buf, data); err != nil {
 		return res, fmt.Errorf("goreset: template: %w", err)
 	}
 
@@ -292,7 +299,9 @@ func cut(part, prefix string, dst *string) bool {
 	return ok
 }
 
-func (p *Package) resetCode(f *types.Var, release string, names *importNames) fieldInfo {
+// resetCode is the code that resets field f; sized is f's type with any type
+// parameters replaced, whose size the model can take.
+func (p *Package) resetCode(f *types.Var, sized types.Type, release string, names *importNames) fieldInfo {
 	var (
 		info    fieldInfo
 		imports []string
@@ -312,6 +321,15 @@ func (p *Package) resetCode(f *types.Var, release string, names *importNames) fi
 	typeName := types.TypeString(f.Type(), qualifier)
 
 	info.Weight = costStore // the common case: one statement, nothing to keep
+
+	// A type parameter has no zero literal of its own, whatever its
+	// constraint: *new(T) is its zero value. It is not reset through a Reset
+	// in its constraint either, as that would panic on a nil pointer.
+	if _, ok := types.Unalias(f.Type()).(*types.TypeParam); ok {
+		info.Code = fmt.Sprintf("r.%s = *new(%s)", info.Field, typeName)
+
+		return info
+	}
 
 	// The sync/atomic types are stored to, but Value is zeroed by the
 	// assignment below: its Store panics on nil and on a type other than
@@ -369,7 +387,7 @@ func (p *Package) resetCode(f *types.Var, release string, names *importNames) fi
 		info.Code = fmt.Sprintf("r.%s.Reset()", info.Field)
 		info.Keep = fmt.Sprintf("keep%s := r.%s", info.Field, info.Field)
 		info.Restore = fmt.Sprintf("r.%s = keep%s\n\tr.%s.Reset()", info.Field, info.Field, info.Field)
-		info.BulkExtra = costKeep + 2*units(p.sizes.Sizeof(f.Type()))
+		info.BulkExtra = costKeep + 2*units(p.sizes.Sizeof(sized))
 		p.forbidCopy(&info, f.Type())
 
 		return info
@@ -415,9 +433,46 @@ func (p *Package) resetCode(f *types.Var, release string, names *importNames) fi
 	// arrays and structs without Reset: assign the zero value, a memclr of the field
 	info.Imports = imports
 	info.Code = fmt.Sprintf("r.%s = %s{}", info.Field, typeName)
-	info.Weight = units(p.sizes.Sizeof(f.Type()))
+	info.Weight = units(p.sizes.Sizeof(sized))
 
 	return info
+}
+
+// generic returns how the generated code spells the type named by obj, with
+// its type parameters (Pair[K, V]), and the struct whose sizes the cost model
+// takes: a generic type has none until instantiated, so each type parameter
+// is replaced by a pointer-sized placeholder.
+func (p *Package) generic(obj types.Object, st *types.Struct) (string, *types.Struct, error) {
+	named, ok := obj.Type().(*types.Named)
+	if !ok || named.TypeParams().Len() == 0 {
+		return obj.Name(), st, nil
+	}
+
+	tparams := named.TypeParams()
+	names := make([]string, tparams.Len())
+	placeholders := make([]types.Type, tparams.Len())
+
+	for i := range tparams.Len() {
+		names[i] = tparams.At(i).Obj().Name()
+		if names[i] == "r" || names[i] == "_" {
+			return "", nil, fmt.Errorf("goreset: %s has a type parameter named %s, "+
+				"which the receiver of Reset cannot refer to; rename it", obj.Name(), names[i])
+		}
+
+		placeholders[i] = types.Typ[types.UnsafePointer]
+	}
+
+	inst, err := types.Instantiate(nil, named, placeholders, false)
+	if err != nil {
+		return "", nil, fmt.Errorf("goreset: size %s: %w", obj.Name(), err)
+	}
+
+	sized, ok := inst.Underlying().(*types.Struct)
+	if !ok {
+		return "", nil, fmt.Errorf("goreset: %s is not a struct", obj.Name())
+	}
+
+	return obj.Name() + "[" + strings.Join(names, ", ") + "]", sized, nil
 }
 
 // hasPointers reports whether a value of type t holds a pointer the garbage
@@ -609,14 +664,14 @@ import (
 {{- if .Bulk}}
 
 // Reset zeroes r in one assignment and gives the slices their arrays back.
-func (r *{{.TypeName}}) Reset() {
+func (r *{{.TypeExpr}}) Reset() {
 {{- range .Fields}}
 {{- if .Keep}}
 	{{.Keep}}
 {{- end}}
 {{- end}}
 
-	*r = {{.TypeName}}{}
+	*r = {{.TypeExpr}}{}
 
 {{- range .Fields}}
 {{- if .Restore}}
@@ -630,7 +685,7 @@ func (r *{{.TypeName}}) Reset() {
 {{- range .Reasons}}
 //   - {{.}}
 {{- end}}
-func (r *{{.TypeName}}) Reset() {
+func (r *{{.TypeExpr}}) Reset() {
 {{- range .Fields}}
 	{{.Code}}
 {{- end}}
