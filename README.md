@@ -41,7 +41,7 @@ func (r *Request) Reset() {
 | Field | Reset |
 |---|---|
 | slice | `clear(s); s = s[:0]` — the backing array is kept |
-| pointer, map, chan, interface, func | `nil` |
+| pointer, map, chan, interface, func | `nil` (an interface too when its methods include `Reset()`) |
 | numbers, bool, string, arrays, plain structs | zero value |
 | value with its own `Reset()` | `r.F.Reset()` |
 | pointer with its own `Reset()` | kept; `r.F.Reset()` when not nil |

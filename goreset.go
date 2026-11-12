@@ -318,7 +318,9 @@ func (p *Package) resetCode(f *types.Var, release string) fieldInfo {
 		return info
 	}
 
-	if hasResetMethod(f.Type()) {
+	// An interface is set to nil even when its method set has Reset: the
+	// call would panic on a nil value and keep a non-nil one.
+	if _, ok := f.Type().Underlying().(*types.Interface); !ok && hasResetMethod(f.Type()) {
 		if _, ok := f.Type().(*types.Pointer); ok {
 			if release != "" {
 				info.Code = fmt.Sprintf("if r.%s != nil { %s(r.%s); r.%s = nil }", info.Field, release, info.Field, info.Field)
@@ -393,9 +395,10 @@ func callCode(f *types.Var, method string) fieldInfo {
 	info := fieldInfo{Field: f.Name(), Weight: costStore, BulkExtra: costKeep}
 	info.Keep = fmt.Sprintf("keep%s := r.%s", info.Field, info.Field)
 
-	if _, ok := f.Type().Underlying().(*types.Pointer); ok {
+	switch f.Type().Underlying().(type) {
+	case *types.Pointer, *types.Interface:
 		info.Code = fmt.Sprintf("if r.%s != nil { r.%s.%s() }", info.Field, info.Field, method)
-	} else {
+	default:
 		info.Code = fmt.Sprintf("r.%s.%s()", info.Field, method)
 	}
 
