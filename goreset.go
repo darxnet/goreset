@@ -110,13 +110,15 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 		tag := reflect.StructTag(structType.Tag(i)).Get("reset")
 
 		if tag == "-" {
-			fields = append(fields, fieldInfo{
+			info := fieldInfo{
 				Field:     f.Name(),
 				Code:      fmt.Sprintf("// r.%s skipped via tag", f.Name()),
 				Keep:      fmt.Sprintf("keep%s := r.%s", f.Name(), f.Name()),
 				Restore:   fmt.Sprintf("r.%s = keep%s", f.Name(), f.Name()),
 				BulkExtra: costKeep,
-			})
+			}
+			p.forbidCopy(&info, f.Type())
+			fields = append(fields, info)
 
 			continue
 		}
@@ -132,7 +134,9 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 		case opts.call != "":
 			// call=Method keeps the field value and calls its method instead,
 			// e.g. `reset:"call=Stop"` for a reusable *time.Timer.
-			fields = append(fields, callCode(f, opts.call))
+			info := callCode(f, opts.call)
+			p.forbidCopy(&info, f.Type())
+			fields = append(fields, info)
 
 		case opts.value != "":
 			// value=EXPR resets the field to EXPR instead of the zero value,
@@ -346,6 +350,7 @@ func (p *Package) resetCode(f *types.Var, release string) fieldInfo {
 		info.Keep = fmt.Sprintf("keep%s := r.%s", info.Field, info.Field)
 		info.Restore = fmt.Sprintf("r.%s = keep%s\n\tr.%s.Reset()", info.Field, info.Field, info.Field)
 		info.BulkExtra = costKeep + 2*units(p.sizes.Sizeof(f.Type()))
+		p.forbidCopy(&info, f.Type())
 
 		return info
 	}
@@ -414,8 +419,75 @@ func isForbidden(typeName string) bool {
 	return strings.HasPrefix(typeName, "sync.")
 }
 
+// forbidCopy rules bulk mode out for a field that bulk mode keeps by copy
+// (reset:"-", call=, a value with Reset) when its value holds a lock.
+func (p *Package) forbidCopy(info *fieldInfo, t types.Type) {
+	lock := heldLock(t)
+	if lock == "" {
+		return
+	}
+
+	typeName := types.TypeString(t, types.RelativeTo(p.pkg))
+	info.Forbidden = true
+	info.Reason = fmt.Sprintf("%s holds a %s, which bulk mode would copy", info.Field, lock)
+	info.Hint = fmt.Sprintf("%s: a %s holds a %s, so it cannot be kept across the assignment; "+
+		"make the field a pointer, or keep the lock outside the pooled value", info.Field, typeName, lock)
+}
+
+// heldLock names the lock a value of type t holds, "" if none: a type of
+// sync or sync/atomic, or, as go vet's copylocks check sees it, a struct
+// whose pointer is a sync.Locker and whose value is not. Pointers,
+// interfaces and the like hold nothing; arrays and struct fields are
+// searched (a struct cannot hold itself by value, so this ends).
+func heldLock(t types.Type) string {
+	for {
+		arr, ok := t.Underlying().(*types.Array)
+		if !ok {
+			break
+		}
+
+		t = arr.Elem()
+	}
+
+	st, ok := t.Underlying().(*types.Struct)
+	if !ok {
+		return ""
+	}
+
+	if named, ok := types.Unalias(t).(*types.Named); ok && named.Obj().Pkg() != nil {
+		switch path := named.Obj().Pkg().Path(); path {
+		case "sync", "sync/atomic":
+			return types.TypeString(named, func(p *types.Package) string { return p.Name() })
+		}
+	}
+
+	if isLocker(types.NewPointer(t)) && !isLocker(t) {
+		return types.TypeString(t, func(p *types.Package) string { return p.Name() })
+	}
+
+	for field := range st.Fields() {
+		if lock := heldLock(field.Type()); lock != "" {
+			return lock
+		}
+	}
+
+	return ""
+}
+
+// isLocker reports whether t has Lock() and Unlock() methods.
+func isLocker(t types.Type) bool {
+	return hasNiladicMethod(t, false, "Lock") && hasNiladicMethod(t, false, "Unlock")
+}
+
+// hasResetMethod reports whether r.F.Reset() compiles for a field of type t.
 func hasResetMethod(t types.Type) bool {
-	meth, _, _ := types.LookupFieldOrMethod(t, true, nil, "Reset")
+	return hasNiladicMethod(t, true, "Reset")
+}
+
+// hasNiladicMethod reports whether t has a method name without parameters
+// and results; addressable counts the methods of *t too.
+func hasNiladicMethod(t types.Type, addressable bool, name string) bool {
+	meth, _, _ := types.LookupFieldOrMethod(t, addressable, nil, name)
 	if meth == nil {
 		return false
 	}

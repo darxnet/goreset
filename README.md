@@ -79,7 +79,9 @@ The mode is chosen per type by a cost model, in units of one field store:
 | array, struct without `Reset()` | 0 | 1 per 16 bytes |
 
 The cheaper mode is generated; a `sync` field forces field-wise mode whatever
-the costs. The constants were fitted on two real structs (700 bytes / 95
+the costs, and so does a field bulk mode would keep by copy (`reset:"-"`,
+`call=` on a value, a value with `Reset()`) whose value holds a lock: a
+`sync` or `sync/atomic` value, or a type `go vet` treats as a lock. The constants were fitted on two real structs (700 bytes / 95
 fields: both modes equal; 2400 bytes / 74 fields: field-wise 2.5x faster) —
 a model, not a measurement, so a struct near the break-even point is worth a
 benchmark of its own.

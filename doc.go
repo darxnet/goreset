@@ -12,7 +12,8 @@
 //	Conn  *Conn        `reset:"release=PutConn"`   // PutConn(r.Conn); r.Conn = nil
 //
 // Fields of sync types are never touched, and a struct holding one is reset
-// field by field. Any other struct is reset either in one assignment
+// field by field, as is a struct whose kept fields (reset:"-", call=, values
+// with Reset) hold a lock that one assignment would copy. Any other struct is reset either in one assignment
 // (`*r = T{}`) with the kept fields restored after it, or field by field,
 // whichever a cost model built on the field sizes rates cheaper; the
 // generated comment says which and why.
