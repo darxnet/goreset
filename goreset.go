@@ -322,10 +322,15 @@ func (p *Package) resetCode(f *types.Var, sized types.Type, release string, name
 
 	info.Weight = costStore // the common case: one statement, nothing to keep
 
-	// A type parameter has no zero literal of its own, whatever its
-	// constraint: *new(T) is its zero value. It is not reset through a Reset
-	// in its constraint either, as that would panic on a nil pointer.
-	if _, ok := types.Unalias(f.Type()).(*types.TypeParam); ok {
+	// A pointer, or a type parameter whose constraint allows only pointers
+	// (P interface{ *T; Reset() }): either can be compared with nil.
+	ptr := isPointer(f.Type())
+
+	// A type parameter has no zero literal of its own: *new(T) is its zero
+	// value. One that is a pointer with Reset is kept and reset like any such
+	// pointer below; any other is zeroed even when its constraint has Reset,
+	// as the call could not be guarded against a nil pointer.
+	if _, ok := types.Unalias(f.Type()).(*types.TypeParam); ok && (!ptr || !hasResetMethod(f.Type())) {
 		info.Code = fmt.Sprintf("r.%s = *new(%s)", info.Field, typeName)
 
 		return info
@@ -362,8 +367,8 @@ func (p *Package) resetCode(f *types.Var, sized types.Type, release string, name
 
 	// An interface is set to nil even when its method set has Reset: the
 	// call would panic on a nil value and keep a non-nil one.
-	if _, ok := f.Type().Underlying().(*types.Interface); !ok && hasResetMethod(f.Type()) {
-		if _, ok := f.Type().(*types.Pointer); ok {
+	if _, iface := f.Type().Underlying().(*types.Interface); (ptr || !iface) && hasResetMethod(f.Type()) {
+		if ptr {
 			if release != "" {
 				info.Code = fmt.Sprintf("if r.%s != nil { %s(r.%s); r.%s = nil }", info.Field, release, info.Field, info.Field)
 				info.Keep = fmt.Sprintf("if r.%s != nil { %s(r.%s) }", info.Field, release, info.Field)
@@ -551,16 +556,64 @@ func callCode(f *types.Var, method string) fieldInfo {
 	info := fieldInfo{Field: f.Name(), Weight: costStore, BulkExtra: costKeep}
 	info.Keep = fmt.Sprintf("keep%s := r.%s", info.Field, info.Field)
 
-	switch f.Type().Underlying().(type) {
-	case *types.Pointer, *types.Interface:
+	_, tparam := types.Unalias(f.Type()).(*types.TypeParam)
+	_, iface := f.Type().Underlying().(*types.Interface)
+
+	// a type parameter cannot be compared with nil unless it is a pointer
+	if isPointer(f.Type()) || (iface && !tparam) {
 		info.Code = fmt.Sprintf("if r.%s != nil { r.%s.%s() }", info.Field, info.Field, method)
-	default:
+	} else {
 		info.Code = fmt.Sprintf("r.%s.%s()", info.Field, method)
 	}
 
 	info.Restore = fmt.Sprintf("r.%s = keep%s\n\t%s", info.Field, info.Field, info.Code)
 
 	return info
+}
+
+// isPointer reports whether t is a pointer type, or a type parameter whose
+// constraint lets only pointers in, like P in [T any, P interface{ *T }].
+func isPointer(t types.Type) bool {
+	switch t := types.Unalias(t).(type) {
+	case *types.Pointer:
+		return true
+	case *types.TypeParam:
+		return pointersOnly(t.Constraint())
+	default:
+		return false
+	}
+}
+
+// pointersOnly reports whether the type set of the constraint c holds only
+// pointers: one of the terms it embeds (an interface's type set is the
+// intersection of them) is a pointer, or a union of pointers.
+func pointersOnly(c types.Type) bool {
+	iface, ok := c.Underlying().(*types.Interface)
+	if !ok {
+		return false
+	}
+
+	for embedded := range iface.EmbeddedTypes() {
+		switch e := types.Unalias(embedded).(type) {
+		case *types.Union:
+			all := e.Len() > 0
+			for term := range e.Terms() {
+				if _, ok := term.Type().Underlying().(*types.Pointer); !ok {
+					all = false
+				}
+			}
+
+			if all {
+				return true
+			}
+		default:
+			if _, ok := e.Underlying().(*types.Pointer); ok || pointersOnly(e) {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // isForbidden reports whether a field of this type must not be touched: the
