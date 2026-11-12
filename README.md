@@ -45,7 +45,7 @@ func (r *Request) Reset() {
 | numbers, bool, string, arrays, plain structs | zero value |
 | value with its own `Reset()` | `r.F.Reset()` |
 | pointer with its own `Reset()` | kept; `r.F.Reset()` when not nil |
-| `atomic.*` | `Store(0)` / `Store(false)` / `Store(nil)` |
+| `sync/atomic` types | `Store(0)` / `Store(false)` / `Store(nil)`; `atomic.Value` is set to its zero value |
 | `sync.*` (Mutex, WaitGroup, Pool...) | left alone |
 
 Struct tags change the treatment of a field:

@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"go/format"
 	"go/types"
+	"path"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"text/template"
 )
@@ -35,9 +37,10 @@ func FileName(typeName string) string {
 }
 
 type fieldInfo struct {
-	Import string
-	Field  string
-	Code   string // field-wise reset
+	// Imports are the paths of the packages Code names.
+	Imports []string
+	Field   string
+	Code    string // field-wise reset
 	// bulk mode: Keep runs before `*r = T{}`, Restore after. Empty Keep with
 	// empty Restore means the bulk zeroing already did the right thing.
 	Keep    string
@@ -103,7 +106,16 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 		// asks for through import=, e.g. `reset:"value=consts.Default,import=example.com/consts"`.
 		tagImports []string
 		fields     []fieldInfo
+		names      = importNames{byPath: map[string]string{}, byName: map[string]string{}, own: map[string]string{}}
 	)
+
+	// a value= expression names its import= package by the package's own
+	// name, so those names are taken first; field types get the rest
+	for i := range structType.NumFields() {
+		if imp := parseTag(reflect.StructTag(structType.Tag(i)).Get("reset")).importPath; imp != "" {
+			names.name(imp, path.Base(imp))
+		}
+	}
 
 	for i := range structType.NumFields() {
 		f := structType.Field(i)
@@ -150,14 +162,12 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 			})
 
 		default:
-			fields = append(fields, p.resetCode(f, opts.release))
+			fields = append(fields, p.resetCode(f, opts.release, &names))
 		}
 	}
 
 	for i := range fields {
-		if f := &fields[i]; f.Import != "" {
-			imports = append(imports, f.Import)
-		}
+		imports = append(imports, fields[i].Imports...)
 	}
 
 	slices.SortFunc(fields, func(a, b fieldInfo) int {
@@ -211,6 +221,9 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 	}
 
 	imports = slices.Compact(slices.Sorted(slices.Values(imports)))
+	for i, path := range imports {
+		imports[i] = names.spec(path)
+	}
 
 	data := struct {
 		PackageName string
@@ -275,10 +288,10 @@ func cut(part, prefix string, dst *string) bool {
 	return ok
 }
 
-func (p *Package) resetCode(f *types.Var, release string) fieldInfo {
+func (p *Package) resetCode(f *types.Var, release string, names *importNames) fieldInfo {
 	var (
-		info       fieldInfo
-		importPath string
+		info    fieldInfo
+		imports []string
 	)
 
 	qualifier := func(other *types.Package) string {
@@ -286,9 +299,9 @@ func (p *Package) resetCode(f *types.Var, release string) fieldInfo {
 			return ""
 		}
 
-		importPath = other.Path()
+		imports = append(imports, other.Path())
 
-		return other.Name()
+		return names.name(other.Path(), other.Name())
 	}
 
 	info.Field = f.Name()
@@ -296,11 +309,14 @@ func (p *Package) resetCode(f *types.Var, release string) fieldInfo {
 
 	info.Weight = costStore // the common case: one statement, nothing to keep
 
-	if strings.HasPrefix(typeName, "atomic.") {
-		switch {
-		case strings.HasPrefix(typeName, "atomic.Pointer"):
+	// The sync/atomic types are stored to, but Value is zeroed by the
+	// assignment below: its Store panics on nil and on a type other than
+	// the one stored before, so it has no zero to store.
+	if atomicName := syncAtomicName(f.Type()); atomicName != "" && atomicName != "Value" {
+		switch atomicName {
+		case "Pointer":
 			info.Code = fmt.Sprintf("r.%s.Store(nil)", info.Field)
-		case typeName == "atomic.Bool":
+		case "Bool":
 			info.Code = fmt.Sprintf("r.%s.Store(false)", info.Field)
 		default:
 			info.Code = fmt.Sprintf("r.%s.Store(0)", info.Field)
@@ -384,11 +400,56 @@ func (p *Package) resetCode(f *types.Var, release string) fieldInfo {
 	}
 
 	// arrays and structs without Reset: assign the zero value, a memclr of the field
-	info.Import = importPath
+	info.Imports = imports
 	info.Code = fmt.Sprintf("r.%s = %s{}", info.Field, typeName)
 	info.Weight = units(p.sizes.Sizeof(f.Type()))
 
 	return info
+}
+
+// syncAtomicName is the name of t when t is a type of sync/atomic, "" if not.
+func syncAtomicName(t types.Type) string {
+	named, ok := types.Unalias(t).(*types.Named)
+	if !ok || named.Obj().Pkg() == nil || named.Obj().Pkg().Path() != "sync/atomic" {
+		return ""
+	}
+
+	return named.Obj().Name()
+}
+
+// importNames gives every package the generated code names a name of its
+// own: the package name, or, when another package has it already, that
+// name with a number appended (atomic, atomic2).
+type importNames struct {
+	byPath map[string]string // import path → name in the generated file
+	byName map[string]string // name → import path
+	own    map[string]string // import path → package name
+}
+
+// name returns the name of the package at importPath, whose own name is own.
+func (n *importNames) name(importPath, own string) string {
+	if name, ok := n.byPath[importPath]; ok {
+		return name
+	}
+
+	name := own
+	for i := 2; n.byName[name] != ""; i++ {
+		name = own + strconv.Itoa(i)
+	}
+
+	n.byPath[importPath], n.byName[name], n.own[importPath] = name, importPath, own
+
+	return name
+}
+
+// spec is the import line for importPath: quoted, with the name in front when it
+// is not the package's own.
+func (n *importNames) spec(importPath string) string {
+	if name := n.byPath[importPath]; name != n.own[importPath] {
+		return name + " " + strconv.Quote(importPath)
+	}
+
+	return strconv.Quote(importPath)
 }
 
 // units is the cost of zeroing or copying size bytes in bulk.
@@ -455,7 +516,7 @@ func heldLock(t types.Type) string {
 	}
 
 	if named, ok := types.Unalias(t).(*types.Named); ok && named.Obj().Pkg() != nil {
-		switch path := named.Obj().Pkg().Path(); path {
+		switch named.Obj().Pkg().Path() {
 		case "sync", "sync/atomic":
 			return types.TypeString(named, func(p *types.Package) string { return p.Name() })
 		}
@@ -505,7 +566,7 @@ package {{.PackageName}}
 
 import (
 {{- range .Imports}}
-	"{{.}}"
+	{{.}}
 {{- end}}
 )
 {{- end}}

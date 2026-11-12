@@ -247,3 +247,62 @@ func TestReset(t *testing.T) {
 			res.Bulk, res.Hints, wantReason, res.Source)
 	}
 }
+
+// TestAtomics: sync/atomic types are reset through Store, except Value,
+// which cannot store a zero of every type it may hold and is zeroed; a type
+// of another package named atomic (go.uber.org/atomic) is no sync/atomic
+// type, and two packages of the same name get distinct import names.
+func TestAtomics(t *testing.T) {
+	t.Parallel()
+
+	srcs := checkGenerated(t, "atomics", map[string]string{
+		"atomic/atomic.go": `// Package atomic stands for go.uber.org/atomic.
+package atomic
+
+type String struct{ v string }
+
+func (s *String) Store(v string) { s.v = v }
+func (s *String) Load() string   { return s.v }
+`,
+		"m.go": `package m
+
+import (
+	"sync"
+	"sync/atomic"
+
+	uatomic "example.com/atomics/atomic"
+)
+
+type Fieldwise struct {
+	Mu sync.Mutex
+	V  atomic.Value
+	U  atomic.Uint32
+	S  uatomic.String
+}
+`,
+		"m_test.go": `package m
+
+import "testing"
+
+func TestReset(t *testing.T) {
+	var f Fieldwise
+	f.Reset()
+
+	f.V.Store("text")
+	f.U.Store(3)
+	f.S.Store("text")
+	f.Reset()
+
+	if f.V.Load() != nil || f.U.Load() != 0 || f.S.Load() != "" {
+		t.Fatalf("Fieldwise = %v %v %q, want zero", f.V.Load(), f.U.Load(), f.S.Load())
+	}
+}
+`,
+	}, "Fieldwise")
+
+	for _, want := range []string{"r.V = atomic.Value{}", "r.U.Store(0)", "r.S = atomic2.String{}"} {
+		if !strings.Contains(srcs["Fieldwise"], want) {
+			t.Errorf("Fieldwise lacks %q:\n%s", want, srcs["Fieldwise"])
+		}
+	}
+}
