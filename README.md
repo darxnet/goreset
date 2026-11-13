@@ -48,6 +48,8 @@ func (r *Request) Reset() {
 | `sync/atomic` types | `Store(0)` / `Store(false)` / `Store(nil)`; `atomic.Value` is set to its zero value |
 | `sync.*` (Mutex, WaitGroup, Pool...) | left alone |
 | `_` (padding) | left out: field by field it is not touched, bulk mode zeroes it |
+| type parameter `T` | `*new(T)`, its zero value, even when its constraint has `Reset()`: the call could not be guarded against nil |
+| type parameter `P` that only pointers satisfy and that has `Reset()` (`P interface{ *T; Reset() }`) | like a pointer with its own `Reset()`: kept; `r.F.Reset()` when not nil |
 
 Struct tags change the treatment of a field:
 
@@ -56,7 +58,7 @@ Struct tags change the treatment of a field:
 | `reset:"-"` | the field is left as it is |
 | `reset:"value=EXPR"` | set to `EXPR` instead of zero, e.g. `value=^uint32(0)` |
 | `reset:"value=pkg.Const,import=example.com/pkg"` | the same with an import the expression needs |
-| `reset:"call=Method"` | kept; `r.F.Method()` is called (`call=Stop` for a `*time.Timer`) |
+| `reset:"call=Method"` | kept; `r.F.Method()` is called (`call=Stop` for a `*time.Timer`), when not nil if the field can be nil; a type parameter that is not only pointers cannot be checked for nil, so the method is called whatever the value |
 | `reset:"release=Func"` | pointer with `Reset()`: `Func(r.F)` is called and the field set to nil |
 
 ## Two modes
@@ -145,6 +147,10 @@ for tools that want the source without the file.
   handled by hand, or released through `release=`.
 - A nested value's `Reset()` is called after the bulk assignment, so it sees
   its own state, not zeroes.
+- A generic struct gets one `Reset` for all its instantiations
+  (`func (r *Pair[K, V]) Reset()`). The cost model sizes each type parameter
+  as one pointer, so the choice of mode is a guess for the instantiations
+  that are much larger.
 
 ## See also
 

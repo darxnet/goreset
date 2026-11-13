@@ -466,3 +466,132 @@ func TestReset(t *testing.T) {
 		t.Errorf("Bulk is not reset in one assignment:\n%s", srcs["Bulk"])
 	}
 }
+
+func TestGeneric(t *testing.T) {
+	t.Parallel()
+
+	srcs := checkGenerated(t, "generic", map[string]string{
+		"m.go": `package m
+
+import "sync"
+
+type Pair[K comparable, V any] struct {
+	Key   K
+	Val   V
+	Items []V
+	Index map[K]V
+	Next  *Pair[K, V]
+}
+
+type Guarded[T any, P interface {
+	*T
+	Reset()
+}] struct {
+	Mu    sync.Mutex
+	Val   T
+	Ptr   P
+	Inner Pair[string, T]
+	Nums  [4]T
+	N     int
+}
+
+type item struct{ n int }
+
+func (i *item) Reset() { i.n = 0 }
+
+type other struct{ n int }
+
+func (o *other) Reset() { o.n = 0 }
+
+type Resetter interface{ Reset() }
+
+type PtrTo[T any] interface {
+	*T
+	Resetter
+}
+
+// Held has type parameters with Reset: only the ones that are pointers can
+// be checked for nil, so only they are kept and reset without a tag.
+type Held[T Resetter, P PtrTo[item], U interface {
+	*item | *other
+	Reset()
+}] struct {
+	Zeroed T
+	Called T ` + "`" + `reset:"call=Reset"` + "`" + `
+	Kept   P
+	Union  U
+	N      int
+}
+
+type Slicy[S ~[]E, E any] struct {
+	Items S
+	Last  E
+}
+`,
+		"m_test.go": `package m
+
+import "testing"
+
+func TestReset(t *testing.T) {
+	next := &Pair[string, int]{}
+	p := Pair[string, int]{Key: "k", Val: 1, Items: []int{1, 2}, Index: map[string]int{"k": 1}, Next: next}
+	p.Reset()
+
+	if p.Key != "" || p.Val != 0 || len(p.Items) != 0 || cap(p.Items) != 2 || p.Index != nil || p.Next != nil {
+		t.Fatalf("Pair = %+v, want zero with the array kept", p)
+	}
+
+	ptr := &item{2}
+	g := Guarded[item, *item]{Val: item{1}, Ptr: ptr, Inner: Pair[string, item]{Key: "k"}, Nums: [4]item{{3}}, N: 4}
+	g.Mu.Lock()
+	g.Reset()
+	g.Mu.Unlock()
+
+	if g.Val != (item{}) || g.Ptr != ptr || ptr.n != 0 || g.Inner.Key != "" || g.Nums != [4]item{} || g.N != 0 {
+		t.Fatalf("Guarded = %+v %+v %+v %+v %d, want zero", g.Val, g.Ptr, g.Inner, g.Nums, g.N)
+	}
+
+	called, kept, union := &item{2}, &item{3}, &other{4}
+	h := Held[*item, *item, *other]{Zeroed: &item{1}, Called: called, Kept: kept, Union: union, N: 5}
+	h.Reset()
+
+	if h.Zeroed != nil || h.Called != called || h.Kept != kept || h.Union != union || h.N != 0 ||
+		called.n != 0 || kept.n != 0 || union.n != 0 {
+		t.Fatalf("Held = %+v, want Zeroed nil, the others kept and reset", h)
+	}
+
+	// nil pointers are not called, but call= is called whatever the value is
+	empty := Held[*item, *item, *other]{Called: &item{}}
+	empty.Reset()
+
+	s := Slicy[[]int, int]{Items: []int{1}, Last: 1}
+	s.Reset()
+
+	if s.Items != nil || s.Last != 0 {
+		t.Fatalf("Slicy = %+v, want zero", s)
+	}
+}
+`,
+	}, "Pair", "Guarded", "Held", "Slicy")
+
+	if !strings.Contains(srcs["Guarded"], "func (r *Guarded[T, P]) Reset()") {
+		t.Errorf("Guarded: receiver without its type parameters:\n%s", srcs["Guarded"])
+	}
+}
+
+func TestGenericReceiverName(t *testing.T) {
+	t.Parallel()
+
+	dir := writeModule(t, "recvname", map[string]string{
+		"m.go": "package m\n\ntype Box[r any] struct{ V r }\n",
+	})
+
+	pkg, err := goreset.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := pkg.Generate("Box"); err == nil {
+		t.Fatal("Generate(Box) succeeded with a type parameter named r, the receiver's name")
+	}
+}
