@@ -10,6 +10,7 @@
 //	Timer *time.Timer  `reset:"call=Stop"`         // kept, method called
 //	Flags uint32       `reset:"value=^uint32(0)"`  // set to EXPR, not zero
 //	Conn  *Conn        `reset:"release=PutConn"`   // PutConn(r.Conn); r.Conn = nil
+//	Body  []byte       `reset:"maxcap=64<<10"`     // array let go once cap > 64 KiB
 //
 // Fields of sync types are never touched, and a struct holding one is reset
 // field by field, as is a struct whose kept fields (reset:"-", call=, values

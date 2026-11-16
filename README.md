@@ -36,6 +36,13 @@ func (r *Request) Reset() {
 }
 ```
 
+Everything is reset unless a tag says otherwise. Pooled state goes wrong in
+the field nobody thought of: a flag like "skip the body" set for one request
+and still set for the next one that takes the object from the pool. A
+hand-written `Reset` lists what to clear and misses what it forgot; a
+generated one lists only what to keep, so a new field is cleared from the
+first `go generate` on.
+
 ## What it does per field
 
 | Field | Reset |
@@ -60,6 +67,7 @@ Struct tags change the treatment of a field:
 | `reset:"value=pkg.Const,import=example.com/pkg"` | the same with an import the expression needs |
 | `reset:"call=Method"` | kept; `r.F.Method()` is called (`call=Stop` for a `*time.Timer`), when not nil if the field can be nil; a type parameter that is not only pointers cannot be checked for nil, so the method is called whatever the value |
 | `reset:"release=Func"` | pointer with `Reset()`: `Func(r.F)` is called and the field set to nil |
+| `reset:"maxcap=N"` | slice: kept and cleared as usual while `cap` is at most `N`, set to nil (the array let go, not cleared) above it; `N` is a constant integer expression of the package, e.g. `maxcap=64<<10` |
 
 ## Two modes
 
@@ -76,6 +84,7 @@ The mode is chosen per type by a cost model, in units of one field store:
 | the struct | `memclr`: 1 per 16 bytes | — |
 | plain field (number, pointer, string, atomic...) | 0 | 1 |
 | slice | 3 (clear, keep, restore) | 2 (clear, reslice) |
+| slice with `maxcap=` | 4 | 3 |
 | value with `Reset()` | 2 + 2 per 16 bytes (copied out and back) | 1 (the call) |
 | pointer with `Reset()`, `call=`, `reset:"-"` | 2 (keep, restore) | 1 |
 | `value=` | 1 | 1 |
@@ -142,9 +151,11 @@ for tools that want the source without the file.
 
 - It must run without concurrent users of the value: atomics are stored,
   not swapped, and bulk mode copies the struct.
-- Slices keep their capacity. A field that must not keep memory between uses
-  (a buffer that may grow very large once) should be tagged `reset:"-"` and
-  handled by hand, or released through `release=`.
+- Slices keep their capacity. A buffer that may grow very large once should
+  be tagged `reset:"maxcap=N"`, so an array past `N` is let go instead of
+  kept for every later use; anything else that must not keep memory between
+  uses is tagged `reset:"-"` and handled by hand, or released through
+  `release=`.
 - A nested value's `Reset()` is called after the bulk assignment, so it sees
   its own state, not zeroes.
 - A generic struct gets one `Reset` for all its instantiations

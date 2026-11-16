@@ -3,7 +3,9 @@ package goreset
 import (
 	"bytes"
 	"fmt"
+	"go/constant"
 	"go/format"
+	"go/token"
 	"go/types"
 	"path"
 	"reflect"
@@ -29,6 +31,7 @@ const (
 	costSlice   = 2 // clear(r.F); r.F = r.F[:0]
 	costKeep    = 2 // keepF := r.F ... r.F = keepF, around the bulk assignment
 	costSliceBK = 3 // clear(r.F); keepF := r.F[:0] ... r.F = keepF
+	costMaxCap  = 1 // the cap(r.F) > N check of a maxcap= slice
 )
 
 // FileName is the file Generate's output is meant for: <type>_reset.gen.go, lower case.
@@ -146,6 +149,10 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 
 		opts := parseTag(tag)
 
+		if tagErr := p.checkMaxCap(f, &opts); tagErr != nil {
+			return res, tagErr
+		}
+
 		if opts.importPath != "" {
 			imports = append(imports, opts.importPath)
 			tagImports = append(tagImports, opts.importPath)
@@ -171,7 +178,7 @@ func (p *Package) Analyze(typeName string) (Result, error) {
 			})
 
 		default:
-			fields = append(fields, p.resetCode(f, sized.Field(i).Type(), opts.release, &names))
+			fields = append(fields, p.resetCode(f, sized.Field(i).Type(), &opts, &names))
 		}
 	}
 
@@ -272,6 +279,7 @@ type tagOptions struct {
 	release    string
 	call       string
 	value      string
+	maxcap     string
 }
 
 func parseTag(tag string) tagOptions {
@@ -282,7 +290,8 @@ func parseTag(tag string) tagOptions {
 		case cut(part, "import=", &opts.importPath),
 			cut(part, "release=", &opts.release),
 			cut(part, "call=", &opts.call),
-			cut(part, "value=", &opts.value):
+			cut(part, "value=", &opts.value),
+			cut(part, "maxcap=", &opts.maxcap):
 		}
 	}
 
@@ -299,9 +308,40 @@ func cut(part, prefix string, dst *string) bool {
 	return ok
 }
 
+// checkMaxCap reports, when the tag has maxcap=, why `reset:"maxcap=N"` cannot apply to field f: it needs
+// a slice reset the default way (no call=, value=, release=, no Reset method
+// of its own), and N must be a constant non-negative integer the package can
+// evaluate, like 4096, 64<<10 or a constant of the package.
+func (p *Package) checkMaxCap(f *types.Var, opts *tagOptions) error {
+	if opts.maxcap == "" {
+		return nil
+	}
+
+	_, slice := f.Type().Underlying().(*types.Slice)
+	if !slice || hasResetMethod(f.Type()) || opts.call != "" || opts.value != "" || opts.release != "" {
+		return fmt.Errorf("goreset: field %s: maxcap= applies only to a slice without call=, value=, "+
+			"release= or a Reset method of its own", f.Name())
+	}
+
+	tv, err := types.Eval(token.NewFileSet(), p.pkg, token.NoPos, opts.maxcap)
+	if err != nil {
+		return fmt.Errorf("goreset: field %s: maxcap=%s: %w", f.Name(), opts.maxcap, err)
+	}
+
+	if tv.Value == nil || tv.Value.Kind() != constant.Int || constant.Sign(tv.Value) < 0 {
+		return fmt.Errorf("goreset: field %s: maxcap=%s is not a constant non-negative integer", f.Name(), opts.maxcap)
+	}
+
+	if _, exact := constant.Int64Val(tv.Value); !exact {
+		return fmt.Errorf("goreset: field %s: maxcap=%s overflows int64", f.Name(), opts.maxcap)
+	}
+
+	return nil
+}
+
 // resetCode is the code that resets field f; sized is f's type with any type
 // parameters replaced, whose size the model can take.
-func (p *Package) resetCode(f *types.Var, sized types.Type, release string, names *importNames) fieldInfo {
+func (p *Package) resetCode(f *types.Var, sized types.Type, opts *tagOptions, names *importNames) fieldInfo {
 	var (
 		info    fieldInfo
 		imports []string
@@ -369,7 +409,7 @@ func (p *Package) resetCode(f *types.Var, sized types.Type, release string, name
 	// call would panic on a nil value and keep a non-nil one.
 	if _, iface := f.Type().Underlying().(*types.Interface); (ptr || !iface) && hasResetMethod(f.Type()) {
 		if ptr {
-			if release != "" {
+			if release := opts.release; release != "" {
 				info.Code = fmt.Sprintf("if r.%s != nil { %s(r.%s); r.%s = nil }", info.Field, release, info.Field, info.Field)
 				info.Keep = fmt.Sprintf("if r.%s != nil { %s(r.%s) }", info.Field, release, info.Field)
 				info.Weight = costSlice // the call and the nil store
@@ -405,6 +445,21 @@ func (p *Package) resetCode(f *types.Var, sized types.Type, release string, name
 		cleared := "r." + info.Field
 		if hasPointers(ut.Elem()) {
 			cleared = fmt.Sprintf("r.%s[:cap(r.%s)]", info.Field, info.Field)
+		}
+
+		// maxcap=N: an array that grew past N is let go instead of kept, so
+		// one huge use does not pin its memory for every later one. It is
+		// not cleared: nothing here reads it again.
+		if opts.maxcap != "" {
+			info.Code = fmt.Sprintf("if cap(r.%s) > %s {\nr.%s = nil\n} else {\nclear(%s)\nr.%s = r.%s[:0]\n}",
+				info.Field, opts.maxcap, info.Field, cleared, info.Field, info.Field)
+			info.Keep = fmt.Sprintf("keep%s := r.%s[:0]\n\tif cap(keep%s) > %s {\nkeep%s = nil\n} else {\nclear(%s)\n}",
+				info.Field, info.Field, info.Field, opts.maxcap, info.Field, cleared)
+			info.Restore = fmt.Sprintf("r.%s = keep%s", info.Field, info.Field)
+			info.Weight = costSlice + costMaxCap
+			info.BulkExtra = costSliceBK + costMaxCap
+
+			return info
 		}
 
 		info.Code = fmt.Sprintf("clear(%s)\nr.%s = r.%s[:0]", cleared, info.Field, info.Field)

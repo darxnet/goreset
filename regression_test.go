@@ -595,3 +595,138 @@ func TestGenericReceiverName(t *testing.T) {
 		t.Fatal("Generate(Box) succeeded with a type parameter named r, the receiver's name")
 	}
 }
+
+// TestMaxCap: a slice tagged maxcap=N keeps its array, cleared, while the
+// capacity is at most N, and lets it go (nil, the array untouched) past N,
+// in both modes. N may be a constant expression of the package.
+func TestMaxCap(t *testing.T) {
+	t.Parallel()
+
+	srcs := checkGenerated(t, "maxcap", map[string]string{
+		"m.go": `package m
+
+import "sync"
+
+const limit = 4
+
+type Bulk struct {
+	B []byte ` + "`" + `reset:"maxcap=limit"` + "`" + `
+	P []*int ` + "`" + `reset:"maxcap=1<<2"` + "`" + `
+	N int
+
+	N0, N1, N2, N3, N4, N5, N6, N7, N8, N9, N10, N11, N12, N13, N14, N15 uint8
+}
+
+type Fieldwise struct {
+	Mu sync.Mutex
+	B  []byte ` + "`" + `reset:"maxcap=limit"` + "`" + `
+	P  []*int ` + "`" + `reset:"maxcap=4"` + "`" + `
+}
+`,
+		"m_test.go": `package m
+
+import "testing"
+
+func TestReset(t *testing.T) {
+	x := 1
+	small := []*int{&x, &x, &x, &x}
+	big := []*int{&x, &x, &x, &x, &x}
+	sb, bb := []byte("abcd"), []byte("abcde")
+
+	b := Bulk{B: sb[:2], P: small[:1], N: 1}
+	b.Reset()
+
+	if len(b.B) != 0 || cap(b.B) != 4 || sb[0] != 0 || len(b.P) != 0 || cap(b.P) != 4 || small[3] != nil || b.N != 0 {
+		t.Fatalf("Bulk under the limit: %+v %v %v, want the arrays kept and cleared", b, sb, small)
+	}
+
+	b = Bulk{B: bb[:1], P: big[:1]}
+	b.Reset()
+
+	if b.B != nil || b.P != nil || bb[0] != 'a' || big[0] == nil {
+		t.Fatalf("Bulk over the limit: %+v %v %v, want nil slices and the arrays untouched", b, bb, big)
+	}
+
+	small = []*int{&x, &x, &x, &x}
+	sb = []byte("abcd")
+
+	var f Fieldwise
+	f.B, f.P = sb[:2], small[:1]
+	f.Reset()
+
+	if len(f.B) != 0 || cap(f.B) != 4 || sb[0] != 0 || len(f.P) != 0 || cap(f.P) != 4 || small[3] != nil {
+		t.Fatalf("Fieldwise under the limit: %v %v, want the arrays kept and cleared", sb, small)
+	}
+
+	f.B, f.P = bb, big
+	f.Reset()
+
+	if f.B != nil || f.P != nil || bb[0] != 'a' || big[0] == nil {
+		t.Fatalf("Fieldwise over the limit: %v %v, want nil slices and the arrays untouched", bb, big)
+	}
+
+	var z Fieldwise
+	z.Reset()
+	z.B = append(z.B, 1)
+}
+`,
+	}, "Bulk", "Fieldwise")
+
+	if !strings.Contains(srcs["Bulk"], "*r = Bulk{}") {
+		t.Errorf("Bulk is not reset in one assignment:\n%s", srcs["Bulk"])
+	}
+
+	for typeName, src := range srcs {
+		if !strings.Contains(src, "> limit {") || !strings.Contains(src, "clear(r.P[:cap(r.P)])") {
+			t.Errorf("%s: want the limit as written and P cleared to its capacity:\n%s", typeName, src)
+		}
+	}
+}
+
+// TestMaxCapErrors: maxcap= is refused on anything but a plain slice and
+// for a limit that is not a constant non-negative integer.
+func TestMaxCapErrors(t *testing.T) {
+	t.Parallel()
+
+	dir := writeModule(t, "maxcaperr", map[string]string{
+		"m.go": `package m
+
+type S []int
+
+func (*S) Reset() {}
+
+type T struct{ X int }
+
+` + strings.Join([]string{
+			"type NotSlice struct{ M map[int]int `reset:\"maxcap=4\"` }",
+			"type OwnReset struct{ Buf S `reset:\"maxcap=4\"` }",
+			"type WithValue struct{ B []byte `reset:\"maxcap=4,value=nil\"` }",
+			"type Negative struct{ B []byte `reset:\"maxcap=-1\"` }",
+			"type NotInt struct{ B []byte `reset:\"maxcap=1.5\"` }",
+			"type Unknown struct{ B []byte `reset:\"maxcap=nope\"` }",
+			"type Variable struct{ B []byte `reset:\"maxcap=v\"` }",
+			"type Huge struct{ B []byte `reset:\"maxcap=1<<70\"` }",
+			"var v = 4",
+		}, "\n") + "\n",
+	})
+
+	pkg, err := goreset.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for typeName, want := range map[string]string{
+		"NotSlice":  "applies only to a slice",
+		"OwnReset":  "applies only to a slice",
+		"WithValue": "applies only to a slice",
+		"Negative":  "not a constant non-negative integer",
+		"NotInt":    "not a constant non-negative integer",
+		"Unknown":   "undefined",
+		"Variable":  "not a constant non-negative integer",
+		"Huge":      "overflows int64",
+	} {
+		if _, err := pkg.Generate(typeName); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("Generate(%s) error = %v, want %q", typeName, err, want)
+		}
+	}
+}
